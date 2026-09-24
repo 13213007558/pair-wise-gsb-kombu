@@ -77,6 +77,7 @@ from kombu.utils.text import version_string_as_tuple
 
 from . import base
 from .base import to_rabbitmq_queue_arguments
+from .publish_tracking import PublishTracker
 
 DEFAULT_PORT = 5672
 DEFAULT_SSL_PORT = 5671
@@ -104,6 +105,10 @@ class Channel(amqp.Channel, base.StdChannel):
 
     Message = Message
 
+    def __init__(self, *args, **kwargs):
+        self._publish_tracker = None
+        super().__init__(*args, **kwargs)
+
     def prepare_message(self, body, priority=None,
                         content_type=None, content_encoding=None,
                         headers=None, properties=None, _Message=amqp.Message):
@@ -123,6 +128,80 @@ class Channel(amqp.Channel, base.StdChannel):
     def message_to_python(self, raw_message):
         """Convert encoded message body back to a Python value."""
         return self.Message(raw_message, channel=self)
+
+    @property
+    def publish_tracker(self):
+        """Tracker merging confirms and returns into publish results.
+
+        The tracker is bound to this channel generation: when the channel
+        or its connection is closed or lost, all publishes still waiting
+        for a conclusion are resolved as UNKNOWN and late events are
+        ignored.
+        """
+        tracker = self._publish_tracker
+        if tracker is None:
+            tracker = self._publish_tracker = PublishTracker()
+            self.events['basic_ack'].add(tracker.handle_ack)
+            self.events['basic_nack'].add(tracker.handle_nack)
+            self.events['basic_return'].add(self._on_tracked_basic_return)
+        return tracker
+
+    def _on_tracked_basic_return(self, exc, exchange, routing_key, message):
+        tracker = self._publish_tracker
+        if tracker is not None:
+            tracker.handle_return(
+                reply_code=getattr(exc, 'reply_code', None),
+                reply_text=getattr(exc, 'reply_text', None),
+                exchange=exchange,
+                routing_key=routing_key,
+                message=message,
+            )
+
+    def basic_publish_tracked(self, message, exchange='', routing_key='',
+                              mandatory=False, immediate=False,
+                              publish_id=None, on_result=None, **kwargs):
+        """Publish message and track its broker-side result.
+
+        Enables publisher confirms on the channel if needed, then
+        registers the publish with the channel's
+        :class:`~kombu.transport.publish_tracking.PublishTracker` so
+        that the later confirm (basic.ack/basic.nack) and a possible
+        basic.return are merged into exactly one terminal
+        :class:`~kombu.transport.publish_tracking.PublishResult`.
+
+        Returns the stable publish id for this publish.  Terminal results
+        are reported through the ``on_result`` callbacks (both the
+        per-publish argument and the tracker level callback).
+        """
+        if not self._confirm_selected:
+            self._confirm_selected = True
+            self.confirm_select()
+        tracker = self.publish_tracker
+        properties = getattr(message, 'properties', None) or {}
+        publish_id = tracker.track(
+            exchange=exchange,
+            routing_key=routing_key,
+            publish_id=publish_id,
+            message_id=properties.get('message_id'),
+            on_result=on_result,
+        )
+        try:
+            self._basic_publish(
+                message, exchange, routing_key, mandatory, immediate,
+                **kwargs)
+        except Exception:
+            # The broker may never have seen this publish, so no confirm
+            # will arrive for it.
+            tracker.unknown(publish_id)
+            raise
+        return publish_id
+
+    def collect(self):
+        """Tear down this channel, expiring pending publish results."""
+        tracker, self._publish_tracker = self._publish_tracker, None
+        if tracker is not None:
+            tracker.close()
+        super().collect()
 
 
 class Connection(amqp.Connection):
@@ -153,6 +232,7 @@ class Transport(base.Transport):
     implements = base.Transport.implements.extend(
         asynchronous=True,
         heartbeats=True,
+        publish_tracking=True,
     )
 
     def __init__(self, client,

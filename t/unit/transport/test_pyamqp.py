@@ -4,10 +4,12 @@ import sys
 from itertools import count
 from unittest.mock import MagicMock, Mock, patch
 
+import amqp
 import pytest
 
 from kombu import Connection
 from kombu.transport import pyamqp
+from kombu.transport.publish_tracking import PublishState
 
 
 def test_amqps_connection():
@@ -85,6 +87,157 @@ class test_Channel:
         assert self.channel.cancel_callbacks['my-consumer-tag'] == on_cancel
 
 
+class test_Channel_publish_tracking:
+
+    def setup_method(self):
+
+        class Channel(pyamqp.Channel):
+            sent_methods = []
+
+            def _x_open(self, *args, **kwargs):
+                pass
+
+            def wait(self, *args, **kwargs):
+                return None
+
+            def _send_method(self, *args, **kwargs):
+                pass
+
+            def send_method(self, sig, *args, **kwargs):
+                self.sent_methods.append(sig)
+                return None
+
+        self.conn = MagicMock()
+        self.conn.confirm_publish = False
+        self.conn._get_free_channel_id.side_effect = count(0).__next__
+        self.conn.channels = {}
+        self.conn.client_properties = {}
+        self.channel = Channel(self.conn, 0)
+        self.results = []
+        self.channel.publish_tracker.on_result = self.results.append
+
+    def publish(self, body='body', message_id=None, **kwargs):
+        properties = {}
+        if message_id is not None:
+            properties['message_id'] = message_id
+        message = self.channel.prepare_message(body, properties=properties)
+        return self.channel.basic_publish_tracked(message, **kwargs)
+
+    def test_publish_tracked__enables_confirms(self):
+        publish_id = self.publish(exchange='ex', routing_key='rk')
+        assert publish_id
+        assert self.channel._confirm_selected
+        assert self.channel.publish_tracker.pending == (publish_id,)
+
+    def test_publish_tracked__custom_publish_id(self):
+        assert self.publish(publish_id='pub-1') == 'pub-1'
+
+    def test_ack__delivered(self):
+        publish_id = self.publish()
+        self.channel._on_basic_ack(1, False)
+        [result] = self.results
+        assert result.publish_id == publish_id
+        assert result.state is PublishState.DELIVERED
+
+    def test_return_then_ack__stays_returned(self):
+        # mandatory unroutable publish: basic.return arrives first, then
+        # the confirm ack; the caller must see a single RETURNED result.
+        publish_id = self.publish(
+            exchange='ex', routing_key='nowhere', mandatory=True)
+        self.channel._on_basic_return(
+            312, 'NO_ROUTE', 'ex', 'nowhere', amqp.Message('body'))
+        self.channel._on_basic_ack(1, False)
+        [result] = self.results
+        assert result.publish_id == publish_id
+        assert result.state is PublishState.RETURNED
+        assert result.reply_code == 312
+        assert result.reply_text == 'NO_ROUTE'
+
+    def test_nack__multiple(self):
+        ids = [self.publish() for _ in range(3)]
+        self.channel._on_basic_nack(3, True)
+        assert [r.state for r in self.results] == [PublishState.NACKED] * 3
+        assert {r.publish_id for r in self.results} == set(ids)
+
+    def test_ack__multiple_out_of_order_with_return(self):
+        returned = self.publish(exchange='ex', routing_key='nowhere',
+                                mandatory=True)
+        delivered = self.publish(exchange='ex', routing_key='rk')
+        self.channel._on_basic_return(
+            312, 'NO_ROUTE', 'ex', 'nowhere', amqp.Message('body'))
+        self.channel._on_basic_ack(2, True)
+        states = {r.publish_id: r.state for r in self.results}
+        assert states == {
+            returned: PublishState.RETURNED,
+            delivered: PublishState.DELIVERED,
+        }
+
+    def test_return__correlates_by_message_id_not_body(self):
+        first = self.publish('same-body', message_id='m1',
+                             exchange='ex', routing_key='rk')
+        second = self.publish('same-body', message_id='m2',
+                              exchange='ex', routing_key='rk')
+        self.channel._on_basic_return(
+            312, 'NO_ROUTE', 'ex', 'rk',
+            amqp.Message('same-body', message_id='m2'))
+        self.channel._on_basic_ack(1, False)
+        states = {r.publish_id: r.state for r in self.results}
+        assert states == {
+            first: PublishState.DELIVERED,
+            second: PublishState.RETURNED,
+        }
+
+    def test_duplicate_events__single_terminal_result(self):
+        self.publish(exchange='ex', routing_key='rk')
+        self.channel._on_basic_ack(1, False)
+        self.channel._on_basic_ack(1, False)
+        self.channel._on_basic_nack(1, False)
+        assert len(self.results) == 1
+
+    def test_per_publish_on_result_callback(self):
+        on_result = Mock()
+        publish_id = self.publish(on_result=on_result)
+        self.channel._on_basic_ack(1, False)
+        [result] = self.results
+        assert result.publish_id == publish_id
+        on_result.assert_called_once_with(result)
+
+    def test_publish_failure__marked_unknown(self):
+        self.channel._basic_publish = Mock(side_effect=OSError('dead'))
+        with pytest.raises(OSError):
+            self.publish()
+        [result] = self.results
+        assert result.state is PublishState.UNKNOWN
+
+    def test_collect__pending_become_unknown(self):
+        self.publish()
+        second = self.publish()
+        self.channel._on_basic_ack(1, False)
+        self.channel.collect()
+        states = {r.publish_id: r.state for r in self.results}
+        assert states[second] is PublishState.UNKNOWN
+        assert self.channel._publish_tracker is None
+
+    def test_collect__stale_events_from_old_generation_ignored(self):
+        tracker = self.channel.publish_tracker
+        publish_id = self.publish()
+        self.channel.collect()
+        # late confirm arriving on the old channel generation must not
+        # change the already concluded (unknown) result.
+        tracker.handle_ack(1)
+        [result] = self.results
+        assert result.publish_id == publish_id
+        assert result.state is PublishState.UNKNOWN
+
+    def test_new_channel_generation__gets_fresh_tracker(self):
+        old_tracker = self.channel.publish_tracker
+        self.publish()
+        self.channel.collect()
+        channel2 = type(self.channel)(self.conn, 1)
+        assert channel2.publish_tracker is not old_tracker
+        assert not old_tracker.active
+
+
 class test_Transport:
 
     def setup_method(self):
@@ -107,6 +260,15 @@ class test_Transport:
 
     def test_driver_version(self):
         assert self.transport.driver_version()
+
+    def test_supports_publish_tracking(self):
+        assert self.transport.supports_publish_tracking
+        assert self.transport.implements.publish_tracking
+
+    def test_virtual_transport_disables_publish_tracking(self):
+        transport = Connection('memory://').transport
+        assert not transport.supports_publish_tracking
+        assert not transport.implements.publish_tracking
 
     def test_drain_events(self):
         connection = Mock()

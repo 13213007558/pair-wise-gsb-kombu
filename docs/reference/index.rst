@@ -38,6 +38,7 @@ Kombu Transports
 
     kombu.transport
     kombu.transport.base
+    kombu.transport.publish_tracking
     kombu.transport.virtual
     kombu.transport.virtual.exchange
     kombu.transport.azurestoragequeues

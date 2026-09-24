@@ -148,6 +148,7 @@ default_transport_capabilities = Implements(
     batch_publish=False,
     exchange_type=frozenset(['direct', 'topic', 'fanout', 'headers']),
     heartbeats=False,
+    publish_tracking=False,
 )
 
 
@@ -266,6 +267,16 @@ class Transport:
     @property
     def supports_heartbeats(self):
         return self.implements.heartbeats
+
+    @property
+    def supports_publish_tracking(self):
+        """Whether this transport reports broker-verified publish results.
+
+        Transports that cannot merge publisher confirms and returned
+        messages into a terminal result per publish must keep this
+        disabled instead of faking broker confirmations.
+        """
+        return self.implements.publish_tracking
 
     @property
     def supports_ev(self):

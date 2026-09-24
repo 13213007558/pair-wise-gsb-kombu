@@ -139,6 +139,11 @@ class test_interface:
         with pytest.raises(NotImplementedError):
             Transport(None).drain_events(None)
 
+    def test_publish_tracking__disabled_by_default(self):
+        transport = Transport(None)
+        assert not transport.implements.publish_tracking
+        assert not transport.supports_publish_tracking
+
     def test_heartbeat_check(self):
         Transport(None).heartbeat_check(Mock(name='connection'))
 
