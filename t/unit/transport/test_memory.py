@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import warnings
 
 import pytest
 
@@ -182,3 +183,151 @@ class test_MemoryTransport:
 
         assert self.q3(self.c).get().payload == {'hello': 'on return'}
         assert self.q3(self.c).get() is None
+
+
+class test_MemoryHeadersExchange:
+
+    exchange = 'test_memory_headers'
+
+    #: binding matrix: (queue, binding arguments)
+    bindings = [
+        ('q_h_all', {'x-match': 'all', 'format': 'pdf', 'pages': 10}),
+        ('q_h_any', {'x-match': 'any', 'format': 'pdf', 'urgent': True}),
+        ('q_h_allx', {'x-match': 'all-with-x',
+                      'x-tenant': 'eu', 'format': 'pdf'}),
+        ('q_h_anyx', {'x-match': 'any-with-x', 'x-tenant': 'us'}),
+        ('q_h_empty_all', {'x-match': 'all'}),
+        ('q_h_empty_any', {'x-match': 'any'}),
+    ]
+
+    #: message/binding matrix: message headers -> expected queues
+    matrix = [
+        ({'format': 'pdf', 'pages': 10},
+         {'q_h_all', 'q_h_any', 'q_h_empty_all'}),
+        ({'format': 'pdf', 'pages': 10, 'x-tenant': 'eu'},
+         {'q_h_all', 'q_h_any', 'q_h_allx', 'q_h_empty_all'}),
+        ({'format': 'pdf', 'pages': 5},
+         {'q_h_any', 'q_h_empty_all'}),
+        ({'urgent': True},
+         {'q_h_any', 'q_h_empty_all'}),
+        ({'x-tenant': 'us'},
+         {'q_h_anyx', 'q_h_empty_all'}),
+        ({'format': 'zip'},
+         {'q_h_empty_all'}),
+        ({},
+         {'q_h_empty_all'}),
+    ]
+
+    def setup_method(self):
+        self.c = Connection(transport='memory')
+        self.channel = self.c.channel()
+        self.channel.exchange_declare(self.exchange, type='headers')
+        for queue, arguments in self.bindings:
+            self.channel.queue_declare(queue)
+            self.channel.queue_bind(
+                queue, self.exchange, arguments=arguments)
+        # the memory transport keeps queues in global state shared
+        # between connections: drop leftovers from previous tests.
+        self.purge()
+
+    def teardown_method(self):
+        self.c.close()
+
+    @property
+    def queues(self):
+        return [queue for queue, _ in self.bindings]
+
+    def publish(self, headers, exchange=None):
+        message = self.channel.prepare_message('body', headers=headers)
+        with warnings.catch_warnings():
+            # unroutable messages are dropped with a warning
+            warnings.simplefilter('ignore')
+            self.channel.basic_publish(
+                message, exchange or self.exchange, '')
+
+    def sizes(self):
+        return {
+            queue: self.channel._size(queue) for queue in self.queues
+        }
+
+    def purge(self):
+        for queue in self.queues:
+            self.channel.queue_purge(queue)
+
+    def test_routing_matrix(self):
+        for headers, expected in self.matrix:
+            self.publish(headers)
+            assert self.sizes() == {
+                queue: int(queue in expected) for queue in self.queues
+            }, 'headers: {!r}'.format(headers)
+            self.purge()
+
+    def test_field_value_types(self):
+        self.channel.queue_declare('q_h_types')
+        self.channel.queue_bind(
+            'q_h_types', self.exchange,
+            arguments={'x-match': 'all', 'flag': True, 'count': 1},
+        )
+        try:
+            # AMQP booleans are not integers: True must not match 1.
+            self.publish({'flag': True, 'count': 1})
+            assert self.channel._size('q_h_types') == 1
+            self.publish({'flag': 1, 'count': 1})
+            self.publish({'flag': True, 'count': True})
+            assert self.channel._size('q_h_types') == 1
+        finally:
+            self.channel.queue_delete('q_h_types')
+
+    def test_multiple_matching_bindings_deliver_once(self):
+        self.channel.queue_declare('q_h_multi')
+        self.channel.queue_bind(
+            'q_h_multi', self.exchange, 'rk1',
+            arguments={'x-match': 'all', 'format': 'pdf'})
+        self.channel.queue_bind(
+            'q_h_multi', self.exchange, 'rk2',
+            arguments={'x-match': 'any', 'format': 'pdf', 'urgent': True})
+        try:
+            self.publish({'format': 'pdf', 'urgent': True})
+            assert self.channel._size('q_h_multi') == 1
+        finally:
+            self.channel.queue_delete('q_h_multi')
+
+    def test_unbind_stops_routing(self):
+        arguments = {'x-match': 'all', 'format': 'pdf', 'pages': 10}
+        self.publish({'format': 'pdf', 'pages': 10})
+        assert self.channel._size('q_h_all') == 1
+        self.purge()
+
+        self.channel.queue_unbind('q_h_all', self.exchange,
+                                  arguments=arguments)
+        self.publish({'format': 'pdf', 'pages': 10})
+        assert self.channel._size('q_h_all') == 0
+        # other bindings are unaffected
+        assert self.channel._size('q_h_any') == 1
+
+    def test_queue_delete_stops_routing(self):
+        self.channel.queue_delete('q_h_all')
+        self.publish({'format': 'pdf', 'pages': 10})
+        assert self.channel._size('q_h_any') == 1
+        assert not self.channel.state.queue_index['q_h_all']
+
+    def test_exchange_delete_stops_routing(self):
+        self.channel.exchange_delete(self.exchange)
+        assert self.exchange not in self.channel.state.exchanges
+        self.publish({'format': 'pdf', 'pages': 10})
+        assert all(size == 0 for size in self.sizes().values())
+
+    def test_entity_integration(self):
+        exchange = Exchange('test_memory_headers_entity', type='headers')
+        queue = Queue(
+            'test_memory_headers_entity_q', exchange=exchange,
+            binding_arguments={'x-match': 'all', 'format': 'pdf'})
+        channel = self.c.channel()
+        producer = Producer(channel, exchange)
+        queue(channel).declare()
+
+        producer.publish({'n': 1}, headers={'format': 'pdf'})
+        producer.publish({'n': 2}, headers={'format': 'zip'})
+
+        assert queue(channel).get().payload == {'n': 1}
+        assert queue(channel).get() is None

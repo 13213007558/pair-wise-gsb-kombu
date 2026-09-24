@@ -572,13 +572,15 @@ class Channel(AbstractChannel, base.StdChannel):
         exchange = exchange or 'amq.direct'
         if self.state.has_binding(queue, exchange, routing_key):
             return
+        # Prepare binding first: may raise on invalid arguments,
+        # in which case the broker state must be left untouched.
+        meta = self.typeof(exchange).prepare_bind(
+            queue, exchange, routing_key, arguments,
+        )
         # Add binding:
         self.state.binding_declare(queue, exchange, routing_key, arguments)
         # Update exchange's routing table:
         table = self.state.exchanges[exchange].setdefault('table', [])
-        meta = self.typeof(exchange).prepare_bind(
-            queue, exchange, routing_key, arguments,
-        )
         table.append(meta)
         if self.supports_fanout:
             self._queue_bind(exchange, *meta)
@@ -711,7 +713,7 @@ class Channel(AbstractChannel, base.StdChannel):
             type = default
         return self.exchange_types[type]
 
-    def _lookup(self, exchange, routing_key, default=None):
+    def _lookup(self, exchange, routing_key, default=None, headers=None):
         """Find all queues matching `routing_key` for the given `exchange`.
 
         Returns
@@ -728,6 +730,7 @@ class Channel(AbstractChannel, base.StdChannel):
             R = self.typeof(exchange).lookup(
                 self.get_table(exchange),
                 exchange, routing_key, default,
+                headers=headers,
             )
         except KeyError:
             R = []
@@ -747,7 +750,9 @@ class Channel(AbstractChannel, base.StdChannel):
         message['redelivered'] = True
         for queue in self._lookup(
             delivery_info['exchange'],
-                delivery_info['routing_key']):
+            delivery_info['routing_key'],
+            headers=message.get('headers'),
+        ):
             self._put(queue, message)
 
     def _restore_at_beginning(self, message):

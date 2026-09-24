@@ -522,15 +522,17 @@ class Channel(virtual.Channel):
         max_if_unlimited = self.bulk_max_messages
         return max_if_unlimited if max_allowed is None else max_allowed
 
-    def _lookup(self, exchange, routing_key, default=None):
+    def _lookup(self, exchange, routing_key, default=None, headers=None):
         exchange_info = self.state.exchanges.get(exchange, {})
         if not exchange_info:
-            return super()._lookup(exchange, routing_key, default)
+            return super()._lookup(exchange, routing_key, default,
+                                   headers=headers)
         ret = self.typeof(exchange).lookup(
             self.get_table(exchange),
             exchange,
             routing_key,
             default,
+            headers=headers,
         )
         if ret:
             return ret

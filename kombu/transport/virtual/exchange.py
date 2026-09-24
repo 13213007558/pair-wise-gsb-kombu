@@ -1,7 +1,7 @@
 """Virtual AMQ Exchange.
 
 Implementations of the standard exchanges defined
-by the AMQ protocol  (excluding the `headers` exchange).
+by the AMQ protocol.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ class ExchangeType:
     def __init__(self, channel):
         self.channel = channel
 
-    def lookup(self, table, exchange, routing_key, default):
+    def lookup(self, table, exchange, routing_key, default, headers=None):
         """Lookup all queues matching `routing_key` in `exchange`.
 
         Returns
@@ -62,7 +62,7 @@ class DirectExchange(ExchangeType):
 
     type = 'direct'
 
-    def lookup(self, table, exchange, routing_key, default):
+    def lookup(self, table, exchange, routing_key, default, headers=None):
         return {
             queue for rkey, _, queue in table
             if rkey == routing_key
@@ -92,7 +92,7 @@ class TopicExchange(ExchangeType):
     #: compiled regex cache
     _compiled = {}
 
-    def lookup(self, table, exchange, routing_key, default):
+    def lookup(self, table, exchange, routing_key, default, headers=None):
         return {
             queue for rkey, pattern, queue in table
             if self._match(pattern, routing_key)
@@ -147,7 +147,7 @@ class FanoutExchange(ExchangeType):
 
     type = 'fanout'
 
-    def lookup(self, table, exchange, routing_key, default):
+    def lookup(self, table, exchange, routing_key, default, headers=None):
         return {queue for _, _, queue in table}
 
     def deliver(self, message, exchange, routing_key, **kwargs):
@@ -156,9 +156,110 @@ class FanoutExchange(ExchangeType):
                 exchange, message, routing_key, **kwargs)
 
 
+class HeadersExchange(ExchangeType):
+    """Headers exchange.
+
+    The 'headers' exchange routes messages based on their headers,
+    which are matched against the binding arguments using the algorithm
+    selected by the special 'x-match' binding argument:
+
+    'all' (the default)
+        every match field must be present in the message headers and
+        equal to the bound value.
+    'any'
+        at least one match field must be present and equal.
+
+    The RabbitMQ extensions 'all-with-x' and 'any-with-x' work the
+    same way, except that match fields whose name starts with 'x-'
+    are also considered (the plain 'all'/'any' modes ignore them).
+
+    A binding without any match fields matches every message in
+    'all' mode, and no message in 'any' mode.
+
+    Values are compared using AMQP field value semantics: missing
+    headers never match, 'null' only matches 'null', and booleans
+    are distinct from integers ('True' does not match '1').
+    """
+
+    type = 'headers'
+
+    #: valid values for the 'x-match' binding argument.
+    MATCH_ALGORITHMS = frozenset({
+        'all', 'any', 'all-with-x', 'any-with-x',
+    })
+
+    def lookup(self, table, exchange, routing_key, default, headers=None):
+        headers = headers or {}
+        return {
+            queue for _, arguments, queue in table
+            if self._matches(arguments, headers)
+        }
+
+    def deliver(self, message, exchange, routing_key, **kwargs):
+        _lookup = self.channel._lookup
+        _put = self.channel._put
+        for queue in _lookup(exchange, routing_key,
+                             headers=message.get('headers')):
+            _put(queue, message, **kwargs)
+
+    def prepare_bind(self, queue, exchange, routing_key, arguments):
+        arguments = arguments or {}
+        match = arguments.get('x-match', 'all')
+        if match not in self.MATCH_ALGORITHMS:
+            raise ValueError(
+                "x-match binding argument must be one of 'all', 'any', "
+                "'all-with-x' or 'any-with-x', got {!r}".format(match))
+        return routing_key, arguments, queue
+
+    def _matches(self, arguments, headers):
+        match = arguments.get('x-match', 'all')
+        with_x = match.endswith('-with-x')
+        fields = {
+            key: value for key, value in arguments.items()
+            if key != 'x-match' and (with_x or not key.startswith('x-'))
+        }
+        if match.startswith('all'):
+            return all(
+                self._field_matches(headers, key, value)
+                for key, value in fields.items()
+            )
+        return any(
+            self._field_matches(headers, key, value)
+            for key, value in fields.items()
+        )
+
+    def _field_matches(self, headers, key, expected):
+        if key not in headers:
+            return False
+        return self._field_equal(expected, headers[key])
+
+    @classmethod
+    def _field_equal(cls, expected, actual):
+        """Compare two AMQP field values, honoring their types.
+
+        Unlike Python, AMQP booleans are not integers and null is
+        not equal to any other value, so True never matches 1
+        and None never matches 0 or ''.
+        """
+        if isinstance(expected, bool) or isinstance(actual, bool):
+            return (isinstance(expected, bool) and
+                    isinstance(actual, bool) and
+                    expected == actual)
+        if (isinstance(expected, (list, tuple)) and
+                isinstance(actual, (list, tuple))):
+            return (len(expected) == len(actual) and
+                    all(cls._field_equal(expect_item, actual_item)
+                        for expect_item, actual_item
+                        in zip(expected, actual)))
+        if type(expected) is not type(actual):
+            return False
+        return expected == actual
+
+
 #: Map of standard exchange types and corresponding classes.
 STANDARD_EXCHANGE_TYPES = {
     'direct': DirectExchange,
     'topic': TopicExchange,
     'fanout': FanoutExchange,
+    'headers': HeadersExchange,
 }
