@@ -148,6 +148,7 @@ default_transport_capabilities = Implements(
     batch_publish=False,
     exchange_type=frozenset(['direct', 'topic', 'fanout', 'headers']),
     heartbeats=False,
+    publish_tracking=False,
 )
 
 
@@ -267,6 +268,14 @@ class Transport:
     def supports_heartbeats(self):
         return self.implements.heartbeats
 
+    @property
+    def supports_publish_tracking(self):
+        """Whether this transport can report broker publish results.
+
+        Transports that do not implement publisher confirms must keep
+        this False and never fabricate confirmations.
+        """
+        return self.implements.publish_tracking
     @property
     def supports_ev(self):
         return self.implements.asynchronous

@@ -77,6 +77,7 @@ from kombu.utils.text import version_string_as_tuple
 
 from . import base
 from .base import to_rabbitmq_queue_arguments
+from .publish_tracking import PublishTracker
 
 DEFAULT_PORT = 5672
 DEFAULT_SSL_PORT = 5671
@@ -104,6 +105,8 @@ class Channel(amqp.Channel, base.StdChannel):
 
     Message = Message
 
+    _publish_tracker = None
+
     def prepare_message(self, body, priority=None,
                         content_type=None, content_encoding=None,
                         headers=None, properties=None, _Message=amqp.Message):
@@ -123,6 +126,73 @@ class Channel(amqp.Channel, base.StdChannel):
     def message_to_python(self, raw_message):
         """Convert encoded message body back to a Python value."""
         return self.Message(raw_message, channel=self)
+
+    @property
+    def publish_tracker(self):
+        """The PublishTracker for this channel, or None if not enabled."""
+        return self._publish_tracker
+
+    def enable_publish_tracking(self):
+        """Enable publisher confirms and return a result tracker.
+
+        The returned PublishTracker merges basic.return and confirm
+        basic.ack/basic.nack events into one terminal result per
+        published message.  Calling this more than once returns the
+        same tracker.
+        """
+        if self._publish_tracker is None:
+            tracker = PublishTracker()
+            generation = tracker.generation
+
+            def on_ack(delivery_tag, multiple):
+                if tracker.generation == generation:
+                    tracker.on_ack(delivery_tag, multiple)
+
+            def on_nack(delivery_tag, multiple):
+                if tracker.generation == generation:
+                    tracker.on_nack(delivery_tag, multiple)
+
+            def on_return(exc, exchange, routing_key, message):
+                if tracker.generation == generation:
+                    tracker.on_return(
+                        exc.reply_code, exc.reply_text,
+                        exchange, routing_key, message)
+
+            self.confirm_select()
+            self.events['basic_ack'].add(on_ack)
+            self.events['basic_nack'].add(on_nack)
+            self.events['basic_return'].add(on_return)
+            self._publish_tracker = tracker
+        return self._publish_tracker
+
+    def basic_publish_tracked(self, message, exchange='', routing_key='',
+                              mandatory=False, **kwargs):
+        """Publish a message and return a stable publish id.
+
+        The publish id can be passed to the tracker's get_result,
+        wait_result or add_callback methods (see publish_tracker) to
+        learn the final broker-side outcome of this exact message.
+        """
+        tracker = self.enable_publish_tracking()
+        publish_id = tracker.track(mandatory=mandatory)
+        try:
+            self.basic_publish(
+                message, exchange, routing_key,
+                mandatory=mandatory, **kwargs)
+        except Exception:
+            tracker.discard(publish_id)
+            raise
+        return publish_id
+
+    def close(self, *args, **kwargs):
+        if self._publish_tracker is not None:
+            self._publish_tracker.on_disconnect()
+        return super().close(*args, **kwargs)
+
+    def _on_close(self, *args, **kwargs):
+        if self._publish_tracker is not None:
+            self._publish_tracker.on_disconnect()
+        return super()._on_close(*args, **kwargs)
 
 
 class Connection(amqp.Connection):
@@ -153,6 +223,7 @@ class Transport(base.Transport):
     implements = base.Transport.implements.extend(
         asynchronous=True,
         heartbeats=True,
+        publish_tracking=True,
     )
 
     def __init__(self, client,
@@ -214,6 +285,14 @@ class Transport(base.Transport):
     def close_connection(self, connection):
         """Close the AMQP broker connection."""
         connection.client = None
+        try:
+            channels = list(connection.channels.values())
+        except (AttributeError, TypeError):
+            channels = []
+        for channel in channels:
+            tracker = getattr(channel, 'publish_tracker', None)
+            if tracker is not None:
+                tracker.on_disconnect()
         connection.close()
 
     def get_heartbeat_interval(self, connection):
