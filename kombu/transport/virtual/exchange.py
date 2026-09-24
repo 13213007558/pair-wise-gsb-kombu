@@ -6,10 +6,6 @@ by the AMQ protocol  (excluding the `headers` exchange).
 
 from __future__ import annotations
 
-import re
-
-from kombu.utils.text import escape_regex
-
 
 class ExchangeType:
     """Base class for exchanges.
@@ -40,7 +36,7 @@ class ExchangeType:
 
         Returns
         -------
-            Tuple[str, Pattern, str]: of `(routing_key, regex, queue)`
+            Tuple[str, object, str]: of `(routing_key, pattern, queue)`
                 to be stored for bindings to this exchange.
         """
         return routing_key, None, queue
@@ -79,17 +75,13 @@ class TopicExchange(ExchangeType):
     """Topic exchange.
 
     The `topic` exchange routes messages based on words separated by
-    dots, using wildcard characters ``*`` (any single word), and ``#``
-    (one or more words).
+    dots, using wildcard characters ``*`` (exactly one word), and ``#``
+    (zero or more words).
     """
 
     type = 'topic'
 
-    #: map of wildcard to regex conversions
-    wildcards = {'*': r'[^\.]+',
-                 '#': r'.*?'}
-
-    #: compiled regex cache
+    #: compiled topic matcher cache
     _compiled = {}
 
     def lookup(self, table, exchange, routing_key, default):
@@ -110,23 +102,75 @@ class TopicExchange(ExchangeType):
         return routing_key, self.key_to_pattern(routing_key), queue
 
     def key_to_pattern(self, rkey):
-        """Get the corresponding regex for any routing key."""
-        return '^%s$' % (r'\.'.join(
-            self.wildcards.get(word, word)
-            for word in escape_regex(rkey, '.#*').split('.')
-        ))
+        """Get a cached matcher for a routing key."""
+        try:
+            return self._compiled[rkey]
+        except KeyError:
+            matcher = self._compiled[rkey] = TopicMatcher(rkey)
+            return matcher
 
     def _match(self, pattern, string):
-        """Match regular expression (cached).
+        """Match a routing key against a cached topic matcher."""
+        if isinstance(pattern, str):
+            pattern = self.key_to_pattern(pattern)
+        return pattern.match(string)
 
-        Same as :func:`re.match`, except the regex is compiled and cached,
-        then reused on subsequent matches with the same pattern.
-        """
-        try:
-            compiled = self._compiled[pattern]
-        except KeyError:
-            compiled = self._compiled[pattern] = re.compile(pattern, re.U)
-        return compiled.match(string)
+
+class TopicMatcher:
+    """Match dot-delimited topic words without regular-expression backtracking."""
+
+    __slots__ = ('routing_key', 'words')
+
+    def __init__(self, routing_key):
+        self.routing_key = routing_key
+        self.words = routing_key.split('.') if routing_key else []
+
+    def initial_states(self):
+        states = {0}
+        self._extend_hash_states(states)
+        return frozenset(states)
+
+    def next_states(self, states, word):
+        next_states = set()
+        for state in states:
+            if state >= len(self.words):
+                continue
+            pattern_word = self.words[state]
+            if (pattern_word == '*' and word) or pattern_word == word:
+                next_states.add(state + 1)
+            elif pattern_word == '#':
+                next_states.add(state)
+        self._extend_hash_states(next_states)
+        return frozenset(next_states)
+
+    def match(self, routing_key):
+        states = self.initial_states()
+        words = routing_key.split('.') if routing_key else []
+        for word in words:
+            states = self.next_states(states, word)
+        return len(self.words) in states
+
+    def _extend_hash_states(self, states):
+        pending = list(states)
+        while pending:
+            state = pending.pop()
+            if (state < len(self.words)
+                    and self.words[state] == '#'
+                    and state + 1 not in states):
+                    states.add(state + 1)
+                    pending.append(state + 1)
+
+    def __eq__(self, other):
+        return isinstance(other, TopicMatcher) and self.routing_key == other.routing_key
+
+    def __hash__(self):
+        return hash(self.routing_key)
+
+    def __str__(self):
+        return self.routing_key
+
+    def __json__(self):
+        return self.routing_key
 
 
 class FanoutExchange(ExchangeType):
