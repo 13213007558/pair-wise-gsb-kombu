@@ -30,10 +30,18 @@
         :members:
         :undoc-members:
 
+    Headers
+    -------
+
+    .. autoclass:: HeadersExchange
+        :members:
+        :undoc-members:
+
+    .. autofunction:: amqp_field_value_equal
+
     Interface
     ---------
 
     .. autoclass:: ExchangeType
         :members:
         :undoc-members:
-

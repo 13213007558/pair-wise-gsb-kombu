@@ -570,15 +570,22 @@ class Channel(AbstractChannel, base.StdChannel):
                    arguments=None, **kwargs):
         """Bind `queue` to `exchange` with `routing key`."""
         exchange = exchange or 'amq.direct'
-        if self.state.has_binding(queue, exchange, routing_key):
+        meta = self.typeof(exchange).prepare_bind(
+            queue, exchange, routing_key, arguments,
+        )
+        if (self.state.has_binding(queue, exchange, routing_key) and
+                meta in self.state.exchanges.get(exchange, {}).get(
+                    'table', [])):
+            # Exact duplicate binding.  Both checks are needed:
+            # bindings to a headers exchange may share queue and
+            # routing key and still differ by arguments, while the
+            # routing table alone may contain stale entries (e.g. of
+            # queues deleted in the meantime).
             return
         # Add binding:
         self.state.binding_declare(queue, exchange, routing_key, arguments)
         # Update exchange's routing table:
         table = self.state.exchanges[exchange].setdefault('table', [])
-        meta = self.typeof(exchange).prepare_bind(
-            queue, exchange, routing_key, arguments,
-        )
         table.append(meta)
         if self.supports_fanout:
             self._queue_bind(exchange, *meta)
