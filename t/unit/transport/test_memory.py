@@ -5,6 +5,7 @@ import socket
 import pytest
 
 from kombu import Connection, Consumer, Exchange, Producer, Queue
+from kombu.transport.virtual.exchange import TopicExchange
 
 
 class test_MemoryTransport:
@@ -182,3 +183,71 @@ class test_MemoryTransport:
 
         assert self.q3(self.c).get().payload == {'hello': 'on return'}
         assert self.q3(self.c).get() is None
+
+
+class test_MemoryTopicExchange:
+
+    def setup_method(self):
+        self.c = Connection(transport='memory')
+        self.channel = self.c.channel()
+        self.exchange = Exchange('test_memory_topic', type='topic')
+        self.producer = Producer(self.channel, self.exchange)
+
+    def teardown_method(self):
+        self.c.close()
+
+    def _declare(self, name, routing_key):
+        queue = Queue(name, exchange=self.exchange,
+                      routing_key=routing_key)
+        queue(self.channel).declare()
+        return queue(self.channel)
+
+    def test_hash_matches_zero_words(self):
+        q1 = self._declare('topic_q1', 'a.#')
+        q2 = self._declare('topic_q2', '#.b')
+        q3 = self._declare('topic_q3', 'a.#.b')
+
+        self.producer.publish({'n': 1}, routing_key='a')
+        self.producer.publish({'n': 2}, routing_key='b')
+        self.producer.publish({'n': 3}, routing_key='a.b')
+
+        # 'a.#' matches 'a' and 'a.b'
+        assert q1.get().payload == {'n': 1}
+        assert q1.get().payload == {'n': 3}
+        assert q1.get() is None
+        # '#.b' matches 'b' and 'a.b'
+        assert q2.get().payload == {'n': 2}
+        assert q2.get().payload == {'n': 3}
+        assert q2.get() is None
+        # 'a.#.b' matches 'a.b'
+        assert q3.get().payload == {'n': 3}
+        assert q3.get() is None
+
+    def test_multiple_matching_bindings_deliver_once(self):
+        queue = self._declare('topic_multi', 'a.#')
+        queue.bind_to(self.exchange, routing_key='#.b')
+        queue.bind_to(self.exchange, routing_key='a.#.b')
+
+        # matches all three bindings of the same queue
+        self.producer.publish({'n': 1}, routing_key='a.b')
+
+        assert queue.get().payload == {'n': 1}
+        assert queue.get() is None
+
+    def test_unbind_rebind_uses_new_rules(self):
+        queue = self._declare('topic_rebind', 'stock.#')
+
+        self.producer.publish({'n': 1}, routing_key='stock')
+        assert queue.get().payload == {'n': 1}
+
+        queue.unbind_from(self.exchange, routing_key='stock.#')
+        self.producer.publish({'n': 2}, routing_key='stock')
+        assert queue.get() is None
+
+        queue.bind_to(self.exchange, routing_key='stock.#')
+        self.producer.publish({'n': 3}, routing_key='stock')
+        assert queue.get().payload == {'n': 3}
+        assert queue.get() is None
+
+        # the compiled pattern cache holds the new word tokens
+        assert TopicExchange._compiled['stock.#'] == ('stock', '#')

@@ -77,7 +77,65 @@ class test_Topic(ExchangeCase):
 
     def test_prepare_bind(self):
         x = self.e.prepare_bind('qFoo', 'eFoo', 'stock.#', {})
-        assert x == ('stock.#', r'^stock\..*?$', 'qFoo')
+        assert x == ('stock.#', 'stock.#', 'qFoo')
+
+    @pytest.mark.parametrize('pattern,routing_key,expected', [
+        # '#' matches zero or more words, including at the edges:
+        ('a.#', 'a', True),
+        ('#.b', 'b', True),
+        ('a.#.b', 'a.b', True),
+        ('a.#.b', 'a.x.y.b', True),
+        ('a.#', 'a.b.c', True),
+        ('#.b', 'x.y.b', True),
+        ('#', 'a.b.c', True),
+        ('#', 'a', True),
+        ('#.#', 'a.b.c', True),
+        ('#.#.b', 'b', True),
+        ('a.#.#.b', 'a.b', True),
+        ('a.#.b.#.c', 'a.b.c', True),
+        ('a.#.b.#.c', 'a.x.b.y.c', True),
+        ('a.#.b.#.c', 'a.x.b.y', False),
+        ('a.#', 'b.a', False),
+        ('a.#.b', 'a.b.c', False),
+        # '*' matches exactly one word:
+        ('a.*.b', 'a.x.b', True),
+        ('a.*.b', 'a.b', False),
+        ('a.*.b', 'a.x.y.b', False),
+        ('*.*', 'a.b', True),
+        ('*.*', 'a.b.c', False),
+        ('#.*', 'a', True),
+        ('#.*', 'a.b.c', True),
+        # plain words are literal, even regex metacharacters:
+        ('stock.$po[ny].^', 'stock.$po[ny].^', True),
+        ('stock.$po[ny].^', 'stock.XpoZnyZ.^', False),
+        ('a.+', 'a.+', True),
+        ('a.+', 'a.x', False),
+        # '*' and '#' in the routing key are ordinary characters:
+        ('a.*.b', 'a.*.b', True),
+        ('a.#.b', 'a.#.b', True),
+    ])
+    def test_match(self, pattern, routing_key, expected):
+        assert self.e._match(pattern, routing_key) == expected
+
+    def test_match_compiled_pattern_cached(self):
+        self.e._match('a.#.b', 'a.b')
+        assert self.e._compiled['a.#.b'] == ('a', '#', 'b')
+
+    def test_match_complexity_bounded_by_states(self):
+        # Pathological for backtracking matchers: many '#' wildcards
+        # against a long key must stay linear in words x tokens.
+        pattern = '.'.join(['#'] * 12 + ['end'])
+        routing_key = '.'.join(['word'] * 500)
+        matched, steps = self.e._match_steps(pattern, routing_key)
+        assert not matched
+        states = len(pattern.split('.')) + 1
+        words = len(routing_key.split('.')) + 1
+        assert steps <= 2 * states * words
+
+        matched, steps = self.e._match_steps(
+            pattern, routing_key + '.end')
+        assert matched
+        assert steps <= 2 * states * words
 
     @pytest.mark.parametrize('exchange,routing_key,default,expected', [
         ('eFoo', 'stock.us.nasdaq', None, {'rFoo', 'rBar'}),

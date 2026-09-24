@@ -1,3 +1,4 @@
+
 """Virtual AMQ Exchange.
 
 Implementations of the standard exchanges defined
@@ -5,11 +6,6 @@ by the AMQ protocol  (excluding the `headers` exchange).
 """
 
 from __future__ import annotations
-
-import re
-
-from kombu.utils.text import escape_regex
-
 
 class ExchangeType:
     """Base class for exchanges.
@@ -79,17 +75,19 @@ class TopicExchange(ExchangeType):
     """Topic exchange.
 
     The `topic` exchange routes messages based on words separated by
-    dots, using wildcard characters ``*`` (any single word), and ``#``
-    (one or more words).
+    dots, using wildcard characters ``*`` (exactly one word), and ``#``
+    (zero or more words).
+
+    Patterns are matched by simulating a small NFA over the words of
+    the routing key instead of using a backtracking regular
+    expression: at most ``len(tokens) + 1`` states are active at any
+    time, so matching takes ``O(len(tokens) * len(words))`` steps no
+    matter how many wildcards the pattern contains.
     """
 
     type = 'topic'
 
-    #: map of wildcard to regex conversions
-    wildcards = {'*': r'[^\.]+',
-                 '#': r'.*?'}
-
-    #: compiled regex cache
+    #: compiled pattern cache, mapping binding pattern to word tokens.
     _compiled = {}
 
     def lookup(self, table, exchange, routing_key, default):
@@ -110,23 +108,70 @@ class TopicExchange(ExchangeType):
         return routing_key, self.key_to_pattern(routing_key), queue
 
     def key_to_pattern(self, rkey):
-        """Get the corresponding regex for any routing key."""
-        return '^%s$' % (r'\.'.join(
-            self.wildcards.get(word, word)
-            for word in escape_regex(rkey, '.#*').split('.')
-        ))
+        """Get the corresponding match pattern for any routing key.
+
+        The binding key is itself the pattern language, so it is kept
+        as-is (some transports serialize it into the binding table);
+        it is compiled to word tokens lazily by :meth:`_match`.
+        """
+        return rkey
+
+    def _compile(self, pattern):
+        """Compile pattern into a tuple of word tokens (cached)."""
+        try:
+            return self._compiled[pattern]
+        except KeyError:
+            tokens = self._compiled[pattern] = tuple(pattern.split('.'))
+            return tokens
 
     def _match(self, pattern, string):
-        """Match regular expression (cached).
+        """Match routing key against pattern (compiled and cached).
 
-        Same as :func:`re.match`, except the regex is compiled and cached,
-        then reused on subsequent matches with the same pattern.
+        Returns true if the routing key matches the pattern.
         """
-        try:
-            compiled = self._compiled[pattern]
-        except KeyError:
-            compiled = self._compiled[pattern] = re.compile(pattern, re.U)
-        return compiled.match(string)
+        matched, _ = self._match_steps(pattern, string)
+        return matched
+
+    def _match_steps(self, pattern, string):
+        """Match routing key, returning ``(matched, steps)``.
+
+        The ``steps`` count is the number of NFA states processed,
+        bounded by ``2 * (len(tokens) + 1) * (len(words) + 1)``.
+        """
+        tokens = self._compile(pattern)
+        last = len(tokens)
+        steps = 0
+
+        def closure(states):
+            # '#' matches zero words: propagate past '#' tokens.
+            nonlocal steps
+            stack = list(states)
+            while stack:
+                steps += 1
+                state = stack.pop()
+                if state < last and tokens[state] == '#':
+                    nxt = state + 1
+                    if nxt not in states:
+                        states.add(nxt)
+                        stack.append(nxt)
+            return states
+
+        states = closure({0})
+        for word in string.split('.'):
+            nxt = set()
+            for state in states:
+                steps += 1
+                if state >= last:
+                    continue
+                token = tokens[state]
+                if token == '#':
+                    nxt.add(state)  # consume one word, stay
+                elif token == '*' or token == word:
+                    nxt.add(state + 1)
+            if not nxt:
+                return False, steps
+            states = closure(nxt)
+        return last in states, steps
 
 
 class FanoutExchange(ExchangeType):
