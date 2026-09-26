@@ -29,6 +29,7 @@ Kombu Core
     kombu.resource
     kombu.serialization
     kombu.native_delayed_delivery
+    kombu.topology
 
 Kombu Transports
 ================

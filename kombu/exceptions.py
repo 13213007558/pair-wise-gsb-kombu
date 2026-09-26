@@ -19,6 +19,8 @@ __all__ = (
     'VersionMismatch', 'SerializerNotInstalled', 'ResourceError',
     'SerializationError', 'EncodeError', 'DecodeError', 'HttpError',
     'InconsistencyError',
+    'TopologyError', 'TopologyConflictError', 'TopologyCycleError',
+    'TopologyCapabilityError', 'TopologyExecutionError',
 )
 
 BaseExceptionType = TypeVar('BaseExceptionType', bound=BaseException)
@@ -96,6 +98,44 @@ class InconsistencyError(ConnectionError):
 
     Depending on the cause it may be possible to retry the operation.
     """
+
+
+class TopologyError(KombuError):
+    """Base class for topology planning and execution errors."""
+
+
+class TopologyConflictError(TopologyError):
+    """Two declarations use the same name with different semantics."""
+
+
+class TopologyCycleError(TopologyError):
+    """Exchange-to-exchange bindings form a dependency cycle."""
+
+
+class TopologyCapabilityError(TopologyError):
+    """The transport does not support a required capability."""
+
+
+class TopologyExecutionError(TopologyError):
+    """A topology plan failed while being executed.
+
+    Attributes
+    ----------
+        step: The plan step that failed.
+        index (int): Zero-based position of the failed step in the plan.
+        total (int): Total number of steps in the plan.
+        original (BaseException): The original exception raised by the step.
+    """
+
+    def __init__(self, step, index, total, original):
+        self.step = step
+        self.index = index
+        self.total = total
+        self.original = original
+        super().__init__(
+            f'topology declaration failed at step {index + 1}/{total} '
+            f'({step.describe()}): {original}',
+        )
 
 
 class HttpError(Exception):
