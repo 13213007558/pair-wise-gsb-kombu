@@ -495,9 +495,14 @@ class test_Connection:
             self.conn.connection)
 
     def test_supports_exchange_type(self):
-        self.conn.transport.implements.exchange_type = {'topic'}
-        assert self.conn.supports_exchange_type('topic')
-        assert not self.conn.supports_exchange_type('fanout')
+        implements = self.conn.transport.implements
+        original = implements.exchange_type
+        implements.exchange_type = {'topic'}
+        try:
+            assert self.conn.supports_exchange_type('topic')
+            assert not self.conn.supports_exchange_type('fanout')
+        finally:
+            implements.exchange_type = original
 
     def test_qos_semantics_matches_spec(self):
         qsms = self.conn.transport.qos_semantics_matches_spec = Mock()

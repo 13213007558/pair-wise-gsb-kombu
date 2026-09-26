@@ -43,6 +43,7 @@ if STATICA_HACK:  # pragma: no cover
     from kombu.pools import connections, producers  # noqa
     from kombu.serialization import disable_insecure_serializers  # noqa
     from kombu.serialization import enable_insecure_serializers  # noqa
+    from kombu.topology import TopologyPlan  # noqa
     from kombu.utils.url import parse_url  # noqa
 
 # Lazy loading.
@@ -61,6 +62,7 @@ all_by_module = {
         'enable_insecure_serializers',
         'disable_insecure_serializers',
     ],
+    'kombu.topology': ['TopologyPlan'],
 }
 
 object_origins = {}
