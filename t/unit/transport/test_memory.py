@@ -136,6 +136,36 @@ class test_MemoryTransport:
         del c1  # so pyflakes doesn't complain.
         del c2
 
+    def test_topic_bind_unbind_rebind(self):
+        # full bind/unbind/rebind cycle over a topic exchange: the old
+        # queue must not receive audit events once unbound, and after
+        # rebinding with a narrower key it only receives matching ones.
+        channel = self.c.channel()
+        audit = Exchange('test_memory_audit', type='topic')
+        old_q = Queue('test_memory_audit_old',
+                      exchange=audit, routing_key='audit.#')
+        old_q(channel).declare()
+
+        producer = Producer(channel, audit)
+        producer.publish({'event': 'login.1'}, routing_key='audit.login')
+        assert old_q(channel).get().payload == {'event': 'login.1'}
+
+        # unbind: no further audit events may reach the old queue.
+        channel.queue_unbind(
+            'test_memory_audit_old', 'test_memory_audit', 'audit.#')
+        producer.publish({'event': 'login.2'}, routing_key='audit.login')
+        assert old_q(channel).get() is None
+
+        # rebind with a narrower key: only matching events arrive,
+        # and only once even though 'audit.#' used to overlap.
+        channel.queue_bind(
+            'test_memory_audit_old', 'test_memory_audit', 'audit.auth.*')
+        producer.publish({'event': 'login.3'}, routing_key='audit.login')
+        producer.publish({'event': 'logout.1'},
+                         routing_key='audit.auth.logout')
+        assert old_q(channel).get().payload == {'event': 'logout.1'}
+        assert old_q(channel).get() is None
+
     def test_drain_events_unregistered_queue(self):
         c1 = self.c.channel()
         producer = self.c.Producer()
