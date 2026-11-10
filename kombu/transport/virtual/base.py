@@ -348,6 +348,11 @@ class Message(base.Message):
 
     def serializable(self):
         props = self.properties
+        # Strict messages defer decompression, but a redelivered message is
+        # stored without its compression header, so make sure the body has
+        # been expanded before re-encoding it.
+        if getattr(self, 'strict', False):
+            self._ensure_body_ready()
         body, _ = self.channel.encode_body(self.body,
                                            props.get('body_encoding'))
         headers = dict(self.headers)
@@ -643,7 +648,10 @@ class Channel(AbstractChannel, base.StdChannel):
         self._active_queues.append(queue)
 
         def _callback(raw_message):
-            message = self.Message(raw_message, channel=self)
+            accept, strict = self._consumer_policy(consumer_tag)
+            message = self.Message(
+                raw_message, channel=self, accept=accept, strict=strict,
+            )
             if not no_ack:
                 self.qos.append(message, message.delivery_tag)
             return callback(message)
@@ -652,6 +660,30 @@ class Channel(AbstractChannel, base.StdChannel):
         self._consumers.add(consumer_tag)
 
         self._reset_cycle()
+
+    def _consumer_policy(self, consumer_tag):
+        """Return the ``(accept, strict)`` policy bound to a consumer.
+
+        Policies are registered by :class:`~kombu.messaging.Consumer` via
+        :meth:`set_consumer_policy`. A channel without a registered policy
+        keeps the historical, non-strict behavior.
+        """
+        policies = getattr(self, '_consumer_policies', None)
+        if not policies:
+            return None, False
+        return policies.get(consumer_tag, (None, False))
+
+    def set_consumer_policy(self, consumer_tag, accept, strict):
+        """Bind an admission policy to a consumer tag."""
+        if not hasattr(self, '_consumer_policies'):
+            self._consumer_policies = {}
+        self._consumer_policies[consumer_tag] = (accept, strict)
+
+    def clear_consumer_policy(self, consumer_tag):
+        """Remove the admission policy bound to a consumer tag."""
+        policies = getattr(self, '_consumer_policies', None)
+        if policies:
+            policies.pop(consumer_tag, None)
 
     def basic_cancel(self, consumer_tag):
         """Cancel consumer by consumer tag."""
@@ -664,6 +696,7 @@ class Channel(AbstractChannel, base.StdChannel):
                 pass
             self._reset_cycle()
             self.connection._callbacks.pop(queue, None)
+            self.clear_consumer_policy(consumer_tag)
 
     def basic_get(self, queue, no_ack=False, **kwargs):
         """Get message by direct access (synchronous)."""

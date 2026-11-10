@@ -108,7 +108,8 @@ DEFAULT_SSL_PORT = 5671
 class Message(base.Message):
     """AMQP Message."""
 
-    def __init__(self, msg, channel=None, **kwargs):
+    def __init__(self, msg, channel=None, accept=None, strict=False,
+                 **kwargs):
         props = msg.properties
         super().__init__(
             body=msg.body,
@@ -119,6 +120,8 @@ class Message(base.Message):
             delivery_info=msg.delivery_info,
             properties=msg.properties,
             headers=props.get('application_headers') or {},
+            accept=accept,
+            strict=strict,
             **kwargs)
 
 
@@ -143,9 +146,28 @@ class Channel(amqp.Channel, base.StdChannel):
     def prepare_queue_arguments(self, arguments, **kwargs):
         return to_rabbitmq_queue_arguments(arguments, **kwargs)
 
+    def set_consumer_policy(self, consumer_tag, accept, strict):
+        """Bind an admission policy to a consumer tag."""
+        if not hasattr(self, '_kombu_consumer_policies'):
+            self._kombu_consumer_policies = {}
+        self._kombu_consumer_policies[consumer_tag] = (accept, strict)
+
+    def clear_consumer_policy(self, consumer_tag):
+        """Remove the admission policy bound to a consumer tag."""
+        policies = getattr(self, '_kombu_consumer_policies', None)
+        if policies:
+            policies.pop(consumer_tag, None)
+
     def message_to_python(self, raw_message):
         """Convert encoded message body back to a Python value."""
-        return self.Message(raw_message, channel=self)
+        accept, strict = None, False
+        policies = getattr(self, '_kombu_consumer_policies', None)
+        if policies:
+            consumer_tag = raw_message.delivery_info.get('consumer_tag')
+            accept, strict = policies.get(consumer_tag, (None, False))
+        return self.Message(
+            raw_message, channel=self, accept=accept, strict=strict,
+        )
 
 
 class Connection(amqp.Connection):

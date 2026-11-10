@@ -485,6 +485,7 @@ class Consumer:
         on_message (Callable): See :attr:`on_message`
         on_decode_error (Callable): see :attr:`on_decode_error`.
         prefetch_count (int): see :attr:`prefetch_count`.
+        strict (bool): see :attr:`strict`.
     """
 
     ContentDisallowed = ContentDisallowed
@@ -523,7 +524,10 @@ class Consumer:
     #: So this can be used as an alternative to :attr:`callbacks` when
     #: you don't want the body to be automatically decoded.
     #: Note that the message will still be decompressed if the message
-    #: has the ``compression`` header set.
+    #: has the ``compression`` header set, unless the consumer runs in
+    #: strict mode (see :attr:`strict`), where decompression is deferred
+    #: until :attr:`~kombu.message.Message.payload` is accessed and the
+    #: content type has passed the admission gate.
     #:
     #: The signature of the callback must take a single argument,
     #: which is the :class:`~kombu.Message` object.
@@ -549,6 +553,24 @@ class Consumer:
     #: in which case only json is allowed.
     accept = None
 
+    #: Strict admission mode.
+    #:
+    #: When enabled together with :attr:`accept`, the content type of
+    #: every received message is checked against the explicit accept set
+    #: before the body is decompressed or a codec is invoked. Messages
+    #: whose content type is not admitted are rejected with
+    #: :exc:`~kombu.exceptions.ContentDisallowed`; neither the
+    #: decompressor nor the decoder runs for them.
+    #:
+    #: The check applies to both the regular :attr:`callbacks` path and
+    #: the raw :attr:`on_message` path, and the built-in trusted content
+    #: types receive no special treatment, so neither ``force=True`` nor
+    #: a trusted content type can bypass the explicit accept set.
+    #:
+    #: Note this only gates content conversion; it does not impose any
+    #: limit on compression ratios or message sizes.
+    strict = False
+
     #: Initial prefetch count
     #:
     #: If set, the consumer will set the prefetch_count QoS value at startup.
@@ -562,7 +584,8 @@ class Consumer:
 
     def __init__(self, channel, queues=None, no_ack=None, auto_declare=None,
                  callbacks=None, on_decode_error=None, on_message=None,
-                 accept=None, prefetch_count=None, tag_prefix=None):
+                 accept=None, prefetch_count=None, tag_prefix=None,
+                 strict=None):
         self.channel = channel
         self.queues = maybe_list(queues or [])
         self.no_ack = self.no_ack if no_ack is None else no_ack
@@ -577,6 +600,8 @@ class Consumer:
         if on_decode_error is not None:
             self.on_decode_error = on_decode_error
         self.accept = prepare_accept_content(accept)
+        if strict is not None:
+            self.strict = strict
         self.prefetch_count = prefetch_count
 
         if self.channel:
@@ -725,8 +750,11 @@ class Consumer:
             mean the server will not send any more messages for this consumer.
         """
         cancel = self.channel.basic_cancel
+        clear_policy = getattr(self.channel, 'clear_consumer_policy', None)
         for tag in self._active_tags.values():
             cancel(tag)
+            if clear_policy is not None:
+                clear_policy(tag)
         self._active_tags.clear()
         self._active_queue_no_ack.clear()
 
@@ -742,6 +770,10 @@ class Consumer:
             pass
         else:
             self.channel.basic_cancel(tag)
+            clear_policy = getattr(
+                self.channel, 'clear_consumer_policy', None)
+            if clear_policy is not None:
+                clear_policy(tag)
         finally:
             self._queues.pop(qname, None)
 
@@ -845,6 +877,12 @@ class Consumer:
             no_ack = queue.no_ack if no_ack is None else no_ack
             tag = self._add_tag(queue, consumer_tag)
             self._active_queue_no_ack[queue.name] = no_ack
+            set_policy = getattr(self.channel, 'set_consumer_policy', None)
+            if set_policy is not None:
+                # Channels that construct Message objects themselves (e.g.
+                # the virtual transports) read this when the message is
+                # built, before any decompression happens.
+                set_policy(tag, self.accept, self.strict)
             queue.consume(tag, self._receive_callback,
                           no_ack=no_ack, nowait=nowait)
         return tag
@@ -861,11 +899,22 @@ class Consumer:
         try:
             m2p = getattr(channel, 'message_to_python', None)
             if m2p:
+                # Channels building Message objects themselves already
+                # received the policy at construction time (see
+                # set_consumer_policy); assigning it again is harmless.
                 message = m2p(message)
-            if accept is not None:
-                message.accept = accept
+            message.accept = accept
+            message.strict = self.strict
             if message.errors:
                 return message._reraise_error(self.on_decode_error)
+            if self.strict:
+                # First content-admission gate: runs before any
+                # decompression or codec call for both delivery styles.
+                message._check_accept()
+                if on_m is None:
+                    # Deferred decompression happens exactly once, and
+                    # only after the admission gate has passed.
+                    message._ensure_body_ready()
             decoded = None if on_m else message.decode()
         except Exception as exc:
             if not self.on_decode_error:

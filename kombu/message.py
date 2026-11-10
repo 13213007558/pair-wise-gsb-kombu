@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 
 from .compression import decompress
-from .exceptions import MessageStateError, reraise
+from .exceptions import ContentDisallowed, MessageStateError, reraise
 from .serialization import loads
 from .utils.functional import dictfilter
 
@@ -45,6 +45,13 @@ class Message:
         properties (Dict): Message properties.
 
         headers (Dict): Message headers.
+
+        accept (Set[str]): Content types this message is allowed to use.
+            The admission policy is bound on the message by the consumer
+            before any content conversion happens.
+
+        strict (bool): When true, the content type is checked against
+            ``accept`` before the body is decompressed or decoded.
     """
 
     MessageStateError = MessageStateError
@@ -56,13 +63,14 @@ class Message:
             '_state', 'channel', 'delivery_tag',
             'content_type', 'content_encoding',
             'delivery_info', 'headers', 'properties',
-            'body', '_decoded_cache', 'accept', '__dict__',
+            'body', '_decoded_cache', 'accept', 'strict',
+            '_compression', '_decompressed', '__dict__',
         )
 
     def __init__(self, body=None, delivery_tag=None,
                  content_type=None, content_encoding=None, delivery_info=None,
                  properties=None, headers=None, postencode=None,
-                 accept=None, channel=None, **kwargs):
+                 accept=None, strict=False, channel=None, **kwargs):
         delivery_info = {} if not delivery_info else delivery_info
         self.errors = [] if self.errors is None else self.errors
         self.channel = channel
@@ -75,13 +83,21 @@ class Message:
         self._decoded_cache = None
         self._state = 'RECEIVED'
         self.accept = accept
+        self.strict = strict
+        self._compression = self.headers.get('compression')
+        self._decompressed = False
 
-        compression = self.headers.get('compression')
-        if not self.errors and compression:
-            try:
-                body = decompress(body, compression)
-            except Exception:
-                self.errors.append(sys.exc_info())
+        if self.strict:
+            # Bind the admission policy and defer every content conversion.
+            # The actual gate runs via _check_accept() before the first
+            # decompression/decode (the consumer does this before invoking
+            # any callback), so rejected messages never reach a
+            # decompressor or codec.
+            self.body = body
+            return
+
+        if not self.errors and self._compression:
+            body = self._decompress(body)
 
         if not self.errors and postencode and isinstance(body, str):
             try:
@@ -89,6 +105,29 @@ class Message:
             except Exception:
                 self.errors.append(sys.exc_info())
         self.body = body
+
+    def _check_accept(self):
+        if self.accept is not None and self.content_type not in self.accept:
+            raise ContentDisallowed(
+                'Refusing to decode content of type {!r}: '
+                'not in the consumer accept list'.format(
+                    self.content_type),
+            )
+
+    def _decompress(self, body):
+        try:
+            body = decompress(body, self._compression)
+            self._decompressed = True
+        except Exception:
+            self.errors.append(sys.exc_info())
+        return body
+
+    def _ensure_body_ready(self):
+        """Run the deferred content conversions, at most once."""
+        if self._decompressed or not self._compression or self.errors:
+            return self.body
+        self.body = self._decompress(self.body)
+        return self.body
 
     def _reraise_error(self, callback=None):
         try:
@@ -202,8 +241,16 @@ class Message:
         return self._decoded_cache
 
     def _decode(self):
+        if self.strict:
+            self._check_accept()
+            self._ensure_body_ready()
+            if self.errors:
+                # A failed decompression must surface before any codec is
+                # invoked, so the decoder never sees corrupt input.
+                self._reraise_error()
         return loads(self.body, self.content_type,
-                     self.content_encoding, accept=self.accept)
+                     self.content_encoding, accept=self.accept,
+                     strict=self.strict)
 
     @property
     def acknowledged(self):

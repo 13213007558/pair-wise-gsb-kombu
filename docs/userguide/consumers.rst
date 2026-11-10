@@ -102,6 +102,79 @@ The full example will look as follows:
             with consumer:
                 conn.drain_events(timeout=1)
 
+Strict content admission
+========================
+
+Passing ``accept`` limits which content types are deserialized, but the
+message body is normally decompressed as soon as the
+:class:`~kombu.message.Message` is constructed, before the accept list is
+consulted. A consumer created with ``strict=True`` closes that gap:
+
+.. code-block:: python
+
+    >>> consumer = Consumer(
+    ...     connection, [queue], accept=['json'], strict=True,
+    ...     callbacks=[handle_message],
+    ... )
+
+In strict mode the admission policy (the consumer's ``accept`` set) is
+bound to each message when the message is constructed, and every content
+conversion is deferred until the consumer first needs the body. Before
+either the decompressor or a serialization codec runs, the message's
+content type is checked against the explicit ``accept`` set. A message
+whose content type is not admitted raises
+:class:`~kombu.exceptions.ContentDisallowed` at that gate, so neither the
+decompressor nor the decoder is ever executed for it.
+
+Which processing stage is intercepted
+-------------------------------------
+
+Strict mode sits between message delivery and content conversion:
+
+1. The message is received and its delivery tag, headers and properties
+   are made available, but its body is left untouched.
+2. The content type is checked against ``accept`` before decompression.
+3. Only an admitted message is decompressed (on first body access) and
+   then decoded.
+
+The policy therefore covers both delivery styles:
+
+* With regular :attr:`~kombu.messaging.Consumer.callbacks`, the gate runs
+  before the automatic decompression and decode that produce the
+  callback's ``body`` argument.
+* With :attr:`~kombu.messaging.Consumer.on_message`, the gate also runs
+  before the raw message is handed to the callback. Accessing
+  ``message.payload`` (or calling :meth:`~kombu.message.Message.decode`)
+  is what triggers the deferred decompression and decode, and the result
+  is memoized, so reading the payload repeatedly converts the body only
+  once.
+
+A rejected message is still a normal, fully addressable
+:class:`~kombu.message.Message` carrying its original delivery tag, so an
+``on_decode_error`` handler (or surrounding code) can call
+:meth:`~kombu.message.Message.reject`, :meth:`~kombu.message.Message.requeue`
+or :meth:`~kombu.message.Message.ack` exactly as for any other delivery
+error. When no ``on_decode_error`` callback is configured, the
+:class:`~kombu.exceptions.ContentDisallowed` exception propagates out of
+:meth:`~kombu.Connection.drain_events`.
+
+The explicit ``accept`` set is the only authority in strict mode. The
+built-in trusted content types (``application/data`` and
+``application/text``) receive no special treatment, and a ``force=True``
+argument cannot bypass the check: content types outside ``accept`` are
+refused regardless. Strict mode defaults to off, so existing consumers
+keep their historical, non-strict behavior unless they opt in.
+
+What strict mode does not do
+----------------------------
+
+Strict admission controls *which* decompressors and codecs may run; it
+does not limit *how much* work they do. In particular, it provides no
+compression-ratio or message-size limit. An admitted but highly
+compressible (a "zip bomb") payload is still expanded normally. Apply
+broker- or application-level size limits if you need protection against
+resource exhaustion.
+
 Consumer mixin classes
 ======================
 

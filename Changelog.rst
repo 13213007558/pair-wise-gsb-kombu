@@ -15,6 +15,7 @@
 
 What's Changed
 ~~~~~~~~~~~~~~
+- Add a strict consumer admission mode (``Consumer(strict=True)``) that checks the content type against the ``accept`` set before the body is decompressed or decoded, so rejected messages never run a decompressor or codec.
 - fix(redis): keep an unacked message when its restore hits a connection error (#2767).
 - fix(sqs): avoid KeyError when a receive completes after basic_cancel (#2772).
 - fix(redis): pause pending BRPOP polling while QoS is full (#2776).

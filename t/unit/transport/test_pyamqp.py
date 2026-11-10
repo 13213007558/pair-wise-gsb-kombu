@@ -61,6 +61,22 @@ class test_Channel:
         message.properties = {}
         assert self.channel.message_to_python(message)
 
+    def test_consumer_policy_is_bound_to_message(self):
+        message = Mock()
+        message.headers = {}
+        message.properties = {}
+        message.delivery_info = {'consumer_tag': 'tag-1'}
+        self.channel.set_consumer_policy(
+            'tag-1', {'application/json'}, True)
+        converted = self.channel.message_to_python(message)
+        assert converted.accept == {'application/json'}
+        assert converted.strict is True
+
+        self.channel.clear_consumer_policy('tag-1')
+        converted = self.channel.message_to_python(message)
+        assert converted.accept is None
+        assert converted.strict is False
+
     def test_close_resolves_connection_cycle(self):
         assert self.channel.connection is not None
         self.channel.close()

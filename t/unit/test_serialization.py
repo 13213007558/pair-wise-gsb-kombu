@@ -109,6 +109,31 @@ class test_Serialization:
     def test_loads_when_data_is_None(self):
         loads(None, 'application/testS', 'utf-8')
 
+    def test_loads_strict_enforces_accept_set(self):
+        with pytest.raises(ContentDisallowed):
+            loads('xxd', 'application/testS', 'utf-8',
+                  accept={'application/json'}, strict=True)
+
+    def test_loads_strict_allows_listed_content_type(self):
+        ret = loads('xxd', 'application/testS', 'utf-8',
+                    accept={'application/testS'}, strict=True)
+        assert ret == 'decoded'
+
+    def test_loads_strict_blocks_trusted_content_type(self):
+        with pytest.raises(ContentDisallowed):
+            loads(b'xxd', 'application/data', 'binary',
+                  accept={'application/json'}, strict=True)
+
+    def test_loads_strict_ignores_force(self):
+        with pytest.raises(ContentDisallowed):
+            loads('xxd', 'application/testS', 'utf-8',
+                  accept={'application/json'}, strict=True, force=True)
+
+    def test_loads_non_strict_keeps_trusted_content_allowed(self):
+        ret = loads(b'xxd', 'application/data', 'binary',
+                    accept={'application/json'})
+        assert ret == b'xxd'
+
     def test_content_type_decoding(self):
         assert loads(
             unicode_string_as_utf8,

@@ -182,6 +182,23 @@ class test_Message:
         assert dict_['properties']['delivery_tag'] == tag
         assert 'compression' not in dict_['headers']
 
+    def test_serializable_strict_message_decompresses_before_redelivery(
+            self):
+        c = client().channel()
+        body, content_type = compress('the quick brown fox...', 'gzip')
+        data = c.prepare_message(
+            body, content_type='application/json',
+            headers={'compression': content_type})
+        data['properties']['delivery_tag'] = uuid()
+        message = c.Message(
+            payload=data, channel=c,
+            accept={'application/json'}, strict=True)
+        assert message._decompressed is False
+
+        dict_ = message.serializable()
+        assert dict_['body'] == b'the quick brown fox...'
+        assert 'compression' not in dict_['headers']
+
 
 class test_AbstractChannel:
 
@@ -255,6 +272,41 @@ class test_Channel:
         assert m
         m.get_bindings()
         m.close()
+
+    def test_consumer_policy_binding(self):
+        assert self.channel._consumer_policy('missing-tag') == (None, False)
+        self.channel.set_consumer_policy(
+            'tag-1', {'application/json'}, True)
+        assert self.channel._consumer_policy('tag-1') == (
+            {'application/json'}, True)
+        self.channel.clear_consumer_policy('tag-1')
+        assert self.channel._consumer_policy('tag-1') == (None, False)
+
+    def test_basic_consume_builds_strict_message_with_policy(self):
+        channel = memory_client().channel()
+        queue = 'strict-policy-queue'
+        channel._new_queue(queue)
+        message = channel.prepare_message(
+            b'body', content_type='application/json',
+            headers={'compression': 'zlib'})
+        channel.basic_publish(message, exchange='', routing_key=queue)
+
+        delivered = []
+        channel.basic_consume(
+            queue, no_ack=True, callback=delivered.append,
+            consumer_tag='strict-tag')
+        channel.set_consumer_policy(
+            'strict-tag', {'application/json'}, True)
+        channel.drain_events(callback=channel.connection._deliver)
+
+        message = delivered[0]
+        assert message.strict is True
+        assert message.accept == {'application/json'}
+        assert message._decompressed is False
+
+        channel.basic_cancel('strict-tag')
+        assert 'strict-tag' not in getattr(
+            channel, '_consumer_policies', {})
 
     def test_exchange_declare(self):
         c = self.channel

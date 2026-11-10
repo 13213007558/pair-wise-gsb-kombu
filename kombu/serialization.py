@@ -221,7 +221,8 @@ class SerializerRegistry:
         return content_type, content_encoding, payload
 
     def loads(self, data, content_type, content_encoding,
-              accept=None, force=False, _trusted_content=TRUSTED_CONTENT):
+              accept=None, force=False, strict=False,
+              _trusted_content=TRUSTED_CONTENT):
         """Decode serialized data.
 
         Deserialize a data stream as serialized using `dumps`
@@ -239,6 +240,16 @@ class SerializerRegistry:
 
             accept (Set): List of content-types to accept.
 
+            force (bool): Override the registry-level disabled content
+                types. Ignored when ``strict`` is true and ``accept`` is
+                configured: an explicit accept list is always enforced.
+
+            strict (bool): When true together with an ``accept`` set, only
+                the content types listed in ``accept`` are admitted. The
+                built-in trusted content types (``application/data`` and
+                ``application/text``) get no special treatment and
+                ``force`` cannot bypass the check.
+
         Raises
         ------
             ContentDisallowed: If the content-type is not accepted.
@@ -250,7 +261,13 @@ class SerializerRegistry:
         content_type = (bytes_to_str(content_type) if content_type
                         else 'application/data')
         if accept is not None:
-            if content_type not in _trusted_content \
+            if strict:
+                # An explicit admission set is the only authority: no
+                # trusted-content shortcut and force cannot override it.
+                if content_type not in accept:
+                    raise self._for_untrusted_content(
+                        content_type, 'not accepted')
+            elif content_type not in _trusted_content \
                     and content_type not in accept:
                 raise self._for_untrusted_content(content_type, 'untrusted')
         else:
