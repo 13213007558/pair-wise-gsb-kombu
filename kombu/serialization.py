@@ -308,6 +308,26 @@ def register_json():
                       content_encoding='utf-8')
 
 
+def register_json_safe():
+    """Register the collision-free JSON serializer under ``json-v2``.
+
+    Unlike :func:`register_json` this codec wraps every message in an
+    explicit versioned envelope and keeps plain dictionaries structurally
+    distinct from extended-type tags, so user payloads containing
+    ``__type__``/``__value__`` keys round-trip unchanged.  It is registered
+    under its own name and content type and never replaces the default
+    ``json`` serializer.
+    """
+    from kombu.utils import json_safe as _json_safe
+
+    registry.register(
+        _json_safe.SERIALIZER_NAME,
+        _json_safe.dumps, _json_safe.loads,
+        content_type=_json_safe.CONTENT_TYPE,
+        content_encoding='utf-8',
+    )
+
+
 def register_yaml():
     """Register a encoder/decoder for YAML serialization.
 
@@ -409,6 +429,7 @@ register_json()
 register_pickle()
 register_yaml()
 register_msgpack()
+register_json_safe()
 
 # Default serializer is 'json'
 registry._set_default_serializer('json')

@@ -128,6 +128,79 @@ content-type is sent as a message header.
 
 .. _sending-raw-data:
 
+Collision-free JSON (``json-v2``)
+=================================
+
+The default ``json`` serializer encodes dates, bytes, UUIDs and any custom
+registered type as a plain two-key dictionary::
+
+    {"__type__": "date", "__value__": "2026-11-10"}
+
+Because this is indistinguishable from ordinary application data, a payload
+that happens to be a dictionary with exactly the keys ``__type__`` and
+``__value__`` is silently turned into the corresponding object when decoded.
+Audit originals stored verbatim can therefore stop being the original text
+after a round trip.
+
+The ``json-v2`` serializer removes the ambiguity structurally. It is
+registered separately under its own name and MIME type, and it never replaces
+the default ``json`` serializer:
+
+* name: ``json-v2``
+* content type: ``application/vnd.kombu.json-v2+json``
+
+Every message is wrapped in an explicit, versioned envelope, and user
+dictionaries are encoded as arrays of key/value pairs while type tags are
+objects. Arrays and objects are disjoint JSON types, so no user value can
+ever look like a type tag::
+
+    {"__kombu_json__": 1, "payload": <encoded value>}
+
+Dictionaries (including nested ones and non-string keys), lists, tuples,
+bytes (utf-8 or base64), dates, datetimes, times, decimals and UUIDs all
+round-trip without colliding. The type registry is shared with the default
+JSON codec, so types added with
+:func:`kombu.utils.json.register_type` continue to work unchanged.
+
+.. code-block:: python
+
+    from kombu import Producer
+
+    producer = Producer(channel, serializer='json-v2')
+
+Consumers accept it explicitly, either by name or by MIME type:
+
+.. code-block:: python
+
+    Consumer(channel, [queue], accept=['json', 'json-v2'])
+
+Because the content type differs from ``application/json``, a legacy consumer
+that only accepts ``json`` rejects a ``json-v2`` message with
+:class:`kombu.exceptions.ContentDisallowed` instead of misreading it, and the
+``json-v2`` decoder refuses payloads that lack its envelope instead of
+guessing. Messages already stored on disk by the legacy codec must be read
+through the explicit legacy entry point:
+
+.. code-block:: python
+
+    from kombu.utils.json_safe import loads_legacy
+
+    original = loads_legacy(on_disk_legacy_bytes)
+
+See ``examples/json_safe_migration`` for a runnable, broker-free example of
+the producer/consumer/``accept`` rollout.
+
+Rolling migration
+-----------------
+
+#. **Dual-read, old-write.** Upgrade every service and widen consumers to
+   ``accept=['json', 'json-v2']``; producers still use ``json``.
+#. **Dual-read, new-write.** Switch producers to ``serializer='json-v2'``
+   while consumers keep accepting both formats, so in-flight and slow
+   consumers still handle legacy messages.
+#. **New-only.** After queues drain and the retention window passes,
+   consumers drop the legacy accept and use ``accept=['json-v2']``.
+
 Sending raw data without Serialization
 ======================================
 

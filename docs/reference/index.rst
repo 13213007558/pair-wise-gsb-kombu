@@ -96,6 +96,7 @@ Kombu utils
     kombu.utils.functional
     kombu.utils.imports
     kombu.utils.json
+    kombu.utils.json_safe
     kombu.utils.limits
     kombu.utils.objects
     kombu.utils.scheduling
