@@ -9,7 +9,8 @@ from unittest.mock import Mock, patch
 import pytest
 
 from kombu import Connection, pidbox
-from kombu.exceptions import ContentDisallowed, InconsistencyError
+from kombu.exceptions import ContentDisallowed, InconsistencyError, PolicyDenied
+from kombu.pidbox import AuthorizationContext, Policy
 from kombu.utils.uuid import uuid
 
 
@@ -446,3 +447,325 @@ class test_PidboxOid:
             res = e.submit(getoid)
             subprocess_oid = res.result()
         assert subprocess_oid != oid
+
+
+READ_ONLY_COMMANDS = frozenset({'ping', 'stats'})
+
+
+class ReadOnlyOpsPolicy(Policy):
+    """Example read-only operations role.
+
+    The trusted role is read from the locally bound ``state``; anything the
+    message itself claims (including a ``role`` argument or header) is
+    ignored.  Commands must be on the read-only allowlist and any
+    ``reply_to`` must point at this mailbox's own reply exchange.
+    """
+
+    def authorize(self, context):
+        role = (context.state or {}).get('role')
+        if role != 'ops-readonly':
+            return False
+        if context.method not in READ_ONLY_COMMANDS:
+            return False
+        if context.reply_to is not None:
+            expected = 'reply.{}.pidbox'.format(context.state['namespace'])
+            if context.reply_to.get('exchange') != expected:
+                return False
+        return True
+
+
+class AdminPolicy(Policy):
+
+    def authorize(self, context):
+        return (context.state or {}).get('role') == 'admin'
+
+
+class ExplodingPolicy(Policy):
+
+    def authorize(self, context):
+        raise RuntimeError('policy boom')
+
+
+class DenyingPolicy(Policy):
+
+    def __init__(self, reason='not allowed'):
+        self.reason = reason
+
+    def authorize(self, context):
+        raise PolicyDenied(self.reason)
+
+
+class test_ReceiverAuthorization:
+    """Two nodes with different policies on the in-memory bus."""
+
+    def setup_method(self):
+        self.connection = Connection(transport='memory')
+        self.ops_mailbox, self.ops_node, self.ops_chan = self._make_node(
+            'auth_ops', ReadOnlyOpsPolicy(), 'ops-readonly')
+        self.admin_mailbox, self.admin_node, self.admin_chan = self._make_node(
+            'auth_admin', AdminPolicy(), 'admin')
+        self.replies = []
+
+    def _make_node(self, namespace, policy, role):
+        mailbox = pidbox.Mailbox(
+            namespace, type='direct', policy=policy)(self.connection)
+        channel = self.connection.channel()
+        state = {'role': role, 'namespace': namespace, 'handler_calls': []}
+        node = mailbox.Node(
+            '{}-node'.format(namespace), state=state, channel=channel)
+        for name in ('ping', 'stats', 'shutdown'):
+            node.handlers[name] = self._make_handler(name)
+        node.listen()
+        mailbox.reply_queue(channel).declare()
+        return mailbox, node, channel
+
+    def _make_handler(self, name):
+        def handler(state, **kwargs):
+            state['handler_calls'].append((name, kwargs))
+            if name == 'ping':
+                return 'pong'
+            if name == 'stats':
+                return {'queue': 1}
+            return 'bye'
+        handler.__name__ = name
+        return handler
+
+    def _drain(self, times=6):
+        for _ in range(times):
+            try:
+                self.connection.drain_events(timeout=0.05)
+            except socket.timeout:
+                break
+
+    def _spy_replies(self):
+        real_publish_reply = pidbox.Mailbox._publish_reply
+        replies = self.replies
+
+        def spy(self, reply, exchange, routing_key, ticket, **kwargs):
+            replies.append((self.namespace, reply, exchange, routing_key))
+            return real_publish_reply(
+                self, reply, exchange, routing_key, ticket, **kwargs)
+
+        return patch.object(pidbox.Mailbox, '_publish_reply', spy)
+
+    def test_mailbox_policy_is_inherited_by_nodes(self):
+        assert self.ops_node.policy is self.ops_mailbox.policy
+        assert isinstance(self.ops_node.policy, ReadOnlyOpsPolicy)
+
+    def test_node_policy_overrides_mailbox_policy(self):
+        mailbox = pidbox.Mailbox('auth_override', type='direct',
+                                 policy=AdminPolicy())(self.connection)
+        node = mailbox.Node('override-node', policy=ReadOnlyOpsPolicy())
+        assert isinstance(node.policy, ReadOnlyOpsPolicy)
+        assert mailbox.policy is not node.policy
+
+    def test_no_policy_keeps_legacy_behavior(self):
+        mailbox = pidbox.Mailbox('auth_legacy', type='direct')(
+            self.connection)
+        node = mailbox.Node('legacy-node', state={'handler_calls': []})
+        node.handlers['ping'] = self._make_handler('ping')
+        assert node.policy is None and mailbox.policy is None
+        assert node.handle_message(
+            {'method': 'ping', 'arguments': {}}, None) == 'pong'
+        assert node.state['handler_calls'] == [('ping', {})]
+
+    def test_allowed_command_runs_handler(self):
+        self.ops_mailbox.cast(['auth_ops-node'], 'ping')
+        self._drain()
+        assert self.ops_node.state['handler_calls'] == [('ping', {})]
+
+    def test_unknown_command_is_denied_without_handler_side_effect(self):
+        self.ops_mailbox.cast(['auth_ops-node'], 'no_such_command')
+        self._drain()
+        assert self.ops_node.state['handler_calls'] == []
+
+    def test_denied_command_has_no_side_effect_and_no_reply(self):
+        with self._spy_replies():
+            self.ops_mailbox.cast(['auth_ops-node'], 'shutdown')
+            self._drain()
+        assert self.ops_node.state['handler_calls'] == []
+        assert self.replies == []
+
+    def test_denied_call_does_not_publish_reflected_reply(self):
+        with self._spy_replies():
+            self.ops_mailbox.call(
+                ['auth_ops-node'], 'shutdown',
+                timeout=0.1, channel=self.ops_chan)
+            self._drain()
+        assert self.ops_node.state['handler_calls'] == []
+        assert self.replies == []
+
+    def test_allowed_call_publishes_reply(self):
+        with self._spy_replies():
+            self.ops_mailbox.call(
+                ['auth_ops-node'], 'ping',
+                timeout=0.3, channel=self.ops_chan)
+            self._drain(10)
+        assert self.ops_node.state['handler_calls'] == [('ping', {})]
+        assert len(self.replies) == 1
+        namespace, reply, exchange, routing_key = self.replies[0]
+        assert namespace == 'auth_ops'
+        assert reply == {'auth_ops-node': 'pong'}
+        assert exchange == self.ops_mailbox.reply_exchange.name
+
+    def test_role_claimed_in_arguments_is_not_trusted(self):
+        with self._spy_replies():
+            self.ops_mailbox.cast(
+                ['auth_ops-node'], 'shutdown', kwargs={'role': 'admin'})
+            self._drain()
+        assert self.ops_node.state['handler_calls'] == []
+        assert self.replies == []
+
+    def test_role_claimed_in_headers_is_not_trusted(self):
+        node = self.ops_node
+
+        class ForgedMessage:
+            headers = {'role': 'admin', 'clock': 0}
+
+        with self._spy_replies():
+            result = node.handle_message(
+                {'method': 'shutdown', 'arguments': {}}, ForgedMessage())
+        assert result is None
+        assert node.state['handler_calls'] == []
+        assert self.replies == []
+
+    def test_out_of_bounds_reply_to_is_rejected(self):
+        node = self.ops_node
+        body = {
+            'method': 'ping',
+            'arguments': {},
+            'destination': ['auth_ops-node'],
+            'ticket': 'T',
+            'reply_to': {'exchange': 'reply.auth_admin.pidbox',
+                         'routing_key': 'attacker'},
+        }
+        with self._spy_replies():
+            assert node.handle_message(body, None) is None
+        assert node.state['handler_calls'] == []
+        assert self.replies == []
+
+    def test_policy_returning_false_fails_closed(self):
+        node = self.ops_mailbox.Node(
+            'false-node',
+            state={'role': 'ops-readonly', 'namespace': 'auth_ops',
+                   'handler_calls': []},
+            channel=self.ops_chan)
+        node.handlers['ping'] = self._make_handler('ping')
+
+        class FalsePolicy(Policy):
+            def authorize(self, context):
+                return False
+
+        node.policy = FalsePolicy()
+        assert node.handle_message(
+            {'method': 'ping', 'arguments': {}}, None) is None
+        assert node.state['handler_calls'] == []
+
+    def test_policy_raising_policy_denied_fails_closed(self, caplog):
+        node = self.ops_mailbox.Node(
+            'denied-node',
+            state={'role': 'ops-readonly', 'namespace': 'auth_ops',
+                   'handler_calls': []},
+            channel=self.ops_chan, policy=DenyingPolicy('nope'))
+        node.handlers['ping'] = self._make_handler('ping')
+        with caplog.at_level('WARNING', logger='kombu.pidbox'):
+            assert node.handle_message(
+                {'method': 'ping', 'arguments': {}}, None) is None
+        assert node.state['handler_calls'] == []
+        assert any('denied by policy' in record.message
+                   and 'nope' in record.message for record in caplog.records)
+
+    def test_policy_raising_unexpected_error_fails_closed(self, caplog):
+        node = self.ops_mailbox.Node(
+            'boom-node',
+            state={'role': 'ops-readonly', 'namespace': 'auth_ops',
+                   'handler_calls': []},
+            channel=self.ops_chan, policy=ExplodingPolicy())
+        node.handlers['ping'] = self._make_handler('ping')
+        with caplog.at_level('ERROR', logger='kombu.pidbox'):
+            assert node.handle_message(
+                {'method': 'ping', 'arguments': {}}, None) is None
+        assert node.state['handler_calls'] == []
+        assert any('policy raised' in record.message for record in caplog.records)
+
+    def test_destination_not_targeting_node_skips_policy_and_handler(self):
+        policy = Mock(wraps=ReadOnlyOpsPolicy())
+        node = self.ops_mailbox.Node(
+            'elsewhere-check', policy=policy,
+            state={'role': 'ops-readonly', 'namespace': 'auth_ops',
+                   'handler_calls': []},
+            channel=self.ops_chan)
+        node.handlers['ping'] = self._make_handler('ping')
+        body = {'method': 'ping', 'arguments': {},
+                'destination': ['some-other-node']}
+        assert node.handle_message(body, None) is None
+        policy.authorize.assert_not_called()
+        assert node.state['handler_calls'] == []
+
+    def test_broadcast_goes_through_same_policy(self):
+        with self._spy_replies():
+            self.ops_mailbox.abcast('stats')
+            self._drain()
+            self.ops_mailbox.abcast('shutdown')
+            self._drain()
+        calls = self.ops_node.state['handler_calls']
+        assert ('stats', {}) in calls
+        assert not any(name == 'shutdown' for name, _ in calls)
+        assert self.replies == []
+
+    def test_pattern_selection_goes_through_same_policy(self):
+        with self._spy_replies():
+            self.ops_mailbox._broadcast(
+                'shutdown', {}, pattern='auth_ops-*', matcher='glob',
+                channel=self.ops_chan)
+            self._drain()
+        assert self.ops_node.state['handler_calls'] == []
+        assert self.replies == []
+
+    def test_admin_node_may_run_command_denied_to_ops_node(self):
+        self.admin_mailbox.cast(['auth_admin-node'], 'shutdown')
+        self._drain()
+        assert self.admin_node.state['handler_calls'] == [
+            ('shutdown', {})]
+        assert self.ops_node.state['handler_calls'] == []
+
+    def test_authorization_context_carries_all_message_fields(self):
+        seen = {}
+
+        class RecordingPolicy(Policy):
+            def authorize(self, context):
+                seen['context'] = context
+                return True
+
+        node = self.ops_mailbox.Node(
+            'context-node', policy=RecordingPolicy(),
+            state={'role': 'ops-readonly', 'namespace': 'auth_ops'},
+            channel=self.ops_chan)
+
+        class Message:
+            headers = {'clock': 7, 'ticket': 'hdr-ticket'}
+
+        body = {
+            'method': 'ping', 'arguments': {'x': 1},
+            'destination': ['context-node'], 'pattern': None,
+            'matcher': None,
+            'reply_to': {'exchange': 'reply.auth_ops.pidbox',
+                         'routing_key': 'rk'},
+            'ticket': 'body-ticket',
+        }
+        assert node.authorize_message(body, Message())
+        context = seen['context']
+        assert isinstance(context, AuthorizationContext)
+        assert context.method == 'ping'
+        assert context.arguments == {'x': 1}
+        assert context.destination == ['context-node']
+        assert context.reply_to['routing_key'] == 'rk'
+        assert context.ticket == 'body-ticket'
+        assert context.headers['clock'] == 7
+        assert context.body is body
+        assert context.hostname == 'context-node'
+        assert context.state['role'] == 'ops-readonly'
+
+    def test_policy_cannot_be_subclassed_without_authorize(self):
+        with pytest.raises(TypeError):
+            Policy()

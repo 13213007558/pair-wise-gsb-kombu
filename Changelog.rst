@@ -5,6 +5,29 @@
 ================
 
 
+.. _version-5.8.0:
+
+5.8.0
+=====
+
+:release-date: TBA
+
+Security
+--------
+
+- pidbox: add an optional receiver-side authorization policy to
+  ``Mailbox``/``Node``.  A configured ``Policy`` inspects the command name,
+  arguments, destination selection, reply destination and the node's
+  locally bound context via an ``AuthorizationContext`` and decides whether
+  the command may execute.  The check runs before any handler and before any
+  reply is published for calls, casts, destination broadcasts and
+  pattern-selected messages; denials and policy errors fail closed and
+  produce no side effects or reflected messages.  Message-declared roles or
+  usernames are not treated as authenticated identities, and broker
+  authentication remains the application's responsibility.  When no policy
+  is configured the previous behavior is preserved.
+
+
 .. _version-5.7.0:
 
 5.7.0

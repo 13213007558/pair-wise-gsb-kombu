@@ -18,7 +18,7 @@ __all__ = (
     'ChannelLimitExceeded', 'ConnectionError', 'ChannelError',
     'VersionMismatch', 'SerializerNotInstalled', 'ResourceError',
     'SerializationError', 'EncodeError', 'DecodeError', 'HttpError',
-    'InconsistencyError',
+    'InconsistencyError', 'PolicyDenied',
 )
 
 BaseExceptionType = TypeVar('BaseExceptionType', bound=BaseException)
@@ -95,6 +95,14 @@ class InconsistencyError(ConnectionError):
     """Data or environment has been found to be inconsistent.
 
     Depending on the cause it may be possible to retry the operation.
+    """
+
+
+class PolicyDenied(KombuError):
+    """A receiver-side authorization policy refused a pidbox command.
+
+    The command is dropped before any registered handler runs and before
+    any reply is published, so it never produces business side effects.
     """
 
 

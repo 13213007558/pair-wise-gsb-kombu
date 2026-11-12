@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import abc
 import socket
 import warnings
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from copy import copy
+from dataclasses import dataclass
 from itertools import count
 from time import time
+from typing import Any
 
 from . import Consumer, Exchange, Producer, Queue
 from .clocks import LamportClock
 from .common import maybe_declare, oid_from
-from .exceptions import InconsistencyError
+from .exceptions import InconsistencyError, PolicyDenied
 from .log import get_logger
 from .matcher import match
 from .utils.functional import maybe_evaluate, reprcall
@@ -30,9 +33,90 @@ Or if you meant to start multiple nodes on the same host please make sure
 you give each node a unique node name!
 """
 
-__all__ = ('Node', 'Mailbox')
+W_POLICY_DENIED = 'pidbox command %r denied by policy: %s'
+W_POLICY_ERROR = 'pidbox authorization policy raised; denying command %r'
+
+__all__ = ('Node', 'Mailbox', 'AuthorizationContext', 'Policy')
 logger = get_logger(__name__)
-debug, error = logger.debug, logger.error
+debug, error, warning = logger.debug, logger.error, logger.warning
+
+
+@dataclass(frozen=True)
+class AuthorizationContext:
+    """Everything a receiver-side :class:`Policy` may inspect.
+
+    The policy receives one of these for every decoded pidbox command that
+    targets this node.  Fields copied from the message
+    (:attr:`method`, :attr:`arguments`, :attr:`destination`, :attr:`pattern`,
+    :attr:`matcher`, :attr:`reply_to`, :attr:`ticket`, :attr:`headers`,
+    :attr:`body`) are attacker-controlled claims: they prove only that the
+    sender could write to the mailbox exchange, never who the sender is.
+    A role or username carried in :attr:`arguments` or :attr:`headers` must
+    never be treated as an authenticated identity.  The only local,
+    application-bound inputs are :attr:`hostname` and :attr:`state`.
+
+    Broker authentication (validating the AMQP connection itself) remains the
+    responsibility of the application and is out of scope of this interface.
+    """
+
+    #: Name of the command the message asks to execute.
+    method: str
+
+    #: Keyword arguments decoded from the message.
+    arguments: dict
+
+    #: Explicit destination hostnames requested by the sender, if any.
+    destination: list | tuple | None
+
+    #: Glob/regexp pattern used for destination selection, if any.
+    pattern: str | None
+
+    #: Matcher engine backing :attr:`pattern`, if any.
+    matcher: str | None
+
+    #: Reply destination claimed by the sender, or :const:`None` for casts.
+    reply_to: dict | None
+
+    #: Correlation ticket for the reply, if any.
+    ticket: str | None
+
+    #: AMQP headers of the received message (when available).
+    headers: dict
+
+    #: The full decoded message body, for custom claims the policy understands.
+    body: dict
+
+    #: Hostname of the node that is about to execute the command.
+    hostname: str
+
+    #: Application-bound local context passed to ``Mailbox.Node``.
+    state: Any = None
+
+
+class Policy(abc.ABC):
+    """Receiver-side authorization policy for a pidbox :class:`Node`.
+
+    Install a subclass on a :class:`Mailbox` (or on an individual node via
+    :meth:`Mailbox.Node`) to decide which decoded commands may run.  The
+    policy runs after the message is decoded and the destination check
+    succeeds, but *before* any registered handler is called and before any
+    reply is published, so a denial has no business side effects and never
+    reflects a message back to the sender.
+
+    The same check applies to calls, casts, broadcast (``abcast``) and
+    pattern-selected messages, because every delivered command enters
+    through :meth:`Node.handle_message`.
+    """
+
+    @abc.abstractmethod
+    def authorize(self, context: AuthorizationContext) -> bool:
+        """Return :const:`True` if the command may execute.
+
+        Returning a false value (or raising :exc:`~kombu.exceptions.PolicyDenied`)
+        denies the command.  Any other exception is also treated as a denial
+        (fail-closed) and logged.
+        """
+        raise NotImplementedError
 
 
 class Node:
@@ -53,12 +137,16 @@ class Node:
     #: current channel.
     channel = None
 
+    #: optional receiver-side :class:`Policy` authorizing incoming commands.
+    policy = None
+
     def __init__(self, hostname, state=None, channel=None,
-                 handlers=None, mailbox=None):
+                 handlers=None, mailbox=None, policy=None):
         self.channel = channel
         self.mailbox = mailbox
         self.hostname = hostname
         self.state = state
+        self.policy = policy
         self.adjust_clock = self.mailbox.clock.adjust
         if handlers is None:
             handlers = {}
@@ -149,8 +237,52 @@ class Node:
         else:
             run_dispatch = True
         if run_dispatch:
+            if not self.authorize_message(body, message):
+                return None
             return self.dispatch(**body)
     dispatch_from_message = handle_message
+
+    def authorization_context(self, body, message=None):
+        """Build the :class:`AuthorizationContext` for a decoded message."""
+        headers = getattr(message, 'headers', None) or {}
+        return AuthorizationContext(
+            method=body.get('method'),
+            arguments=body.get('arguments') or {},
+            destination=body.get('destination'),
+            pattern=body.get('pattern'),
+            matcher=body.get('matcher'),
+            reply_to=body.get('reply_to'),
+            ticket=body.get('ticket'),
+            headers=headers,
+            body=body,
+            hostname=self.hostname,
+            state=self.state,
+        )
+
+    def authorize_message(self, body, message=None):
+        """Run the receiver-side policy before dispatch.
+
+        Returns :const:`True` when no policy is configured (preserving the
+        historical behavior) or the configured policy allows the command.
+        Denials and policy errors fail closed: the command is dropped, no
+        handler runs and no reply is published.
+        """
+        policy = self.policy or getattr(self.mailbox, 'policy', None)
+        if policy is None:
+            return True
+        context = self.authorization_context(body, message)
+        try:
+            allowed = policy.authorize(context)
+        except PolicyDenied as exc:
+            warning(W_POLICY_DENIED, context.method, exc)
+            return False
+        except Exception as exc:
+            error(W_POLICY_ERROR, context.method, exc_info=1)
+            return False
+        if not allowed:
+            warning(W_POLICY_DENIED, context.method, 'policy returned False')
+            return False
+        return True
 
     def reply(self, data, exchange, routing_key, ticket, **kwargs):
         self.mailbox._publish_reply(data, exchange, routing_key, ticket,
@@ -186,12 +318,17 @@ class Mailbox:
     #: Message serializer
     serializer = None
 
+    #: Optional receiver-side :class:`Policy` shared by nodes created from
+    #: this mailbox.  Nodes may override it with their own policy.
+    policy = None
+
     def __init__(self, namespace,
                  type='direct', connection=None, clock=None,
                  accept=None, serializer=None, producer_pool=None,
                  queue_ttl=None, queue_expires=None,
                  queue_durable=False, queue_exclusive=True,
-                 reply_queue_ttl=None, reply_queue_expires=10.0):
+                 reply_queue_ttl=None, reply_queue_expires=10.0,
+                 policy=None):
         self.namespace = namespace
         self.connection = connection
         self.type = type
@@ -208,6 +345,7 @@ class Mailbox:
         self.reply_queue_ttl = reply_queue_ttl
         self.reply_queue_expires = reply_queue_expires
         self._producer_pool = producer_pool
+        self.policy = policy
         if queue_exclusive and queue_durable:
             raise ValueError(
                 "queue_exclusive and queue_durable cannot both be True "
@@ -219,9 +357,13 @@ class Mailbox:
         bound.connection = connection
         return bound
 
-    def Node(self, hostname=None, state=None, channel=None, handlers=None):
+    def Node(self, hostname=None, state=None, channel=None, handlers=None,
+             policy=None):
         hostname = hostname or socket.gethostname()
-        return self.node_cls(hostname, state, channel, handlers, mailbox=self)
+        if policy is None:
+            policy = self.policy
+        return self.node_cls(hostname, state, channel, handlers,
+                             mailbox=self, policy=policy)
 
     def call(self, destination, command, kwargs=None,
              timeout=None, callback=None, channel=None):
